@@ -10,18 +10,19 @@
  */
 import 'dotenv/config';
 import { createApp, isDockerSocketReachable, isProcAvailable, isPtyAvailable } from './app.js';
-import { validateEnv, validateEnvSafe, getConfigSummary } from './config/env.js';
 import type { EnvConfig } from './config/env.js';
 
 // Re-export for backward compatibility with tests and external usage
 export { createApp, isDockerSocketReachable, isProcAvailable, isPtyAvailable } from './app.js';
 export { validateEnv, validateEnvSafe, getConfigSummary } from './config/env.js';
-export type { EnvConfig } from './config/env.js';
-export type { AppInstance, ModuleInstances, DegradationStatus } from './app.js';
 
 // --- Legacy bootstrap wrapper (for backward compat with existing tests) ---
 
-export function bootstrap(envConfig?: EnvConfig) {
+/**
+ * Bootstrap the application.
+ * @deprecated Use `createApp` directly for better type safety.
+ */
+export function bootstrap(envConfig?: EnvConfig): any {
   const instance = createApp(envConfig);
   return {
     app: instance.app,
@@ -33,6 +34,8 @@ export function bootstrap(envConfig?: EnvConfig) {
     shutdown: instance.shutdown,
   };
 }
+
+export type BootstrapReturnType = ReturnType<typeof bootstrap>;
 
 // --- Auto-start when run directly ---
 
