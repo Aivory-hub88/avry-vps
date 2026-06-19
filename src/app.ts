@@ -301,17 +301,15 @@ function createDomainDbAdapter(db: Database.Database) {
 export function createApp(envConfig?: EnvConfig): AppInstance {
   const config = envConfig ?? validateEnv();
 
-  // ─── Startup Validation (Requirements 5.6, 11.10) ─────────────────────────
+  // ─── Startup Validation ─────────────────────────────────────────────────
   // Only enforce in production/non-test environments; tests provide their own config
   if (!process.env.VITEST && !envConfig) {
     if (!process.env.VPS_PANEL_API_TOKEN) {
-      console.error('[VPS Panel] FATAL: VPS_PANEL_API_TOKEN environment variable is not set. The monitoring API requires an authentication token to operate securely.');
-      process.exit(1);
+      console.warn('[VPS Panel] WARNING: VPS_PANEL_API_TOKEN not set. Monitoring API will require session auth only.');
     }
 
     if (!process.env.DATABASE_URL) {
-      console.error('[VPS Panel] FATAL: DATABASE_URL environment variable is not set. PostgreSQL is required for monitoring features.');
-      process.exit(1);
+      console.warn('[VPS Panel] WARNING: DATABASE_URL not set. PostgreSQL monitoring features will be disabled.');
     }
   }
 
