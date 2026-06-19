@@ -233,7 +233,6 @@ function retry(): void {
 function connectSocket(): void {
   const authStore = useAuthStore();
   socket = io(window.location.origin, {
-    transports: ['websocket'],
     auth: { token: authStore.token },
   });
 

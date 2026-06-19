@@ -164,9 +164,33 @@ onMounted(() => {
   containersStore.fetchContainers();
   refreshInterval = setInterval(() => containersStore.fetchContainers(), 15000);
 
-  // Connect Socket.IO for real-time resource updates
+  // Fetch container stats via REST as primary source (reliable)
+  async function fetchResourceStats() {
+    try {
+      const response = await fetch('/api/system/metrics', {
+        headers: { Authorization: `Bearer ${authStore.token}` },
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.containers && Array.isArray(data.containers)) {
+          for (const c of data.containers) {
+            const memoryPercent = c.memoryLimitMB > 0
+              ? (c.memoryUsageMB / c.memoryLimitMB) * 100
+              : 0;
+            containerResources.value[c.id] = {
+              cpuPercent: c.cpuPercent ?? 0,
+              memoryPercent,
+            };
+          }
+        }
+      }
+    } catch { /* silent */ }
+  }
+  fetchResourceStats();
+  setInterval(fetchResourceStats, 5000);
+
+  // Also connect Socket.IO for faster real-time updates (if available)
   socket = io({
-    transports: ['websocket'],
     auth: { token: authStore.token },
   });
   socket.on('resource:update', (data: { containers?: Array<{ id: string; name: string; cpuPercent: number; memoryUsageMB: number; memoryLimitMB: number }> }) => {

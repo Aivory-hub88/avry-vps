@@ -53,7 +53,7 @@ async function fetchMetrics(): Promise<void> {
 
 onMounted(() => {
   fetchMetrics();
-  refreshInterval = setInterval(fetchMetrics, 15000);
+  refreshInterval = setInterval(fetchMetrics, 5000);
 });
 
 onUnmounted(() => {
