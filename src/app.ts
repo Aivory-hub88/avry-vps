@@ -47,6 +47,7 @@ import { createProjectRegistry } from './services/project-registry.js';
 import { createHistoricalMetricsService } from './services/historical-metrics.js';
 import { createUserResourceTracker } from './services/user-resource-tracking.js';
 import { createSettingsService, type SettingsService } from './services/settings-service.js';
+import { createSettingsRouter } from './routes/settings.js';
 import { createDownsamplingEngine, type DownsamplingEngine } from './services/downsampling-engine.js';
 import {
   createSettingsHotReload,
@@ -393,6 +394,10 @@ export function createApp(envConfig?: EnvConfig): AppInstance {
       // ─── Initialize Settings Service ──────────────────────────────────────────
       settingsService = createSettingsService(pgClient);
       console.log('[VPS Panel] Settings service initialized');
+
+      // Mount settings route now that service is available
+      app.use('/api/settings', createSettingsRouter(settingsService));
+      console.log('[VPS Panel] Settings route mounted');
 
       // ─── Initialize Downsampling Engine ───────────────────────────────────────
       downsamplingEngine = createDownsamplingEngine(pgClient, settingsService);

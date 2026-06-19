@@ -107,7 +107,34 @@ export function registerRoutes(app: Express, modules: ModuleRegistry): void {
   app.use('/api/audit', createAuditRouter(auditLogger));
   app.use('/api/jobs', createJobsRouter(modules.jobQueue, auditLogger));
   app.use('/api/alerts', createAlertsRouter(modules.alertSystem, auditLogger));
+
+  // Settings route — register unconditionally. If settingsService is available now, use it.
+  // If not (PostgreSQL initializes later), the app.ts will mount it after initializePostgres().
   if (modules.settingsService) {
     app.use('/api/settings', createSettingsRouter(modules.settingsService));
+  } else {
+    // Placeholder: return 503 until settings service is initialized
+    app.use('/api/settings', (_req, res) => {
+      res.status(503).json({ error: 'Settings service initializing. Try again shortly.' });
+    });
   }
+
+  // System metrics endpoint (for dashboard ResourceWidget)
+  app.get('/api/system/metrics', (req, res) => {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) { res.status(401).json({ error: 'Authentication required' }); return; }
+    const session = authModule.validateSession(token);
+    if (!session) { res.status(401).json({ error: 'Invalid session' }); return; }
+
+    const resourceWidget = (modules as any).resourceWidget;
+    const update = resourceWidget?.getLatestUpdate?.() as any;
+    if (update && update.system) {
+      const sys = update.system;
+      res.json({ cpu: sys.cpu || { usagePercent: 0 }, memory: sys.memory || { usedGB: 0, totalGB: 0, usagePercent: 0 }, disk: sys.disk || { usedGB: 0, totalGB: 0, usagePercent: 0 }, network: sys.network || { inBytesPerSec: 0, outBytesPerSec: 0 }, containers: update.containers || [] });
+    } else if (update) {
+      res.json(update);
+    } else {
+      res.json({ cpu: { usagePercent: 0 }, memory: { usedGB: 0, totalGB: 0, usagePercent: 0 }, disk: { usedGB: 0, totalGB: 0, usagePercent: 0 }, network: { inBytesPerSec: 0, outBytesPerSec: 0 }, containers: [] });
+    }
+  });
 }

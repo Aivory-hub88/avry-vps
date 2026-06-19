@@ -18,6 +18,19 @@ export function createAlertsRouter(
   const router = Router();
 
   /**
+   * GET /api/alerts
+   * Return alert history (for dashboard compatibility).
+   */
+  router.get('/', async (req: Request, res: Response) => {
+    try {
+      const history = await alertSystem.getAlertHistory();
+      res.json(history);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
    * GET /api/alerts/channels
    * List configured alert channels.
    */
