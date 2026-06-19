@@ -109,16 +109,14 @@ export function registerRoutes(app: Express, modules: ModuleRegistry): void {
   app.use('/api/jobs', createJobsRouter(modules.jobQueue, auditLogger));
   app.use('/api/alerts', createAlertsRouter(modules.alertSystem, auditLogger));
 
-  // Settings route — register unconditionally. If settingsService is available now, use it.
-  // If not (PostgreSQL initializes later), the app.ts will mount it after initializePostgres().
-  if (modules.settingsService) {
-    app.use('/api/settings', createSettingsRouter(modules.settingsService));
-  } else {
-    // Placeholder: return 503 until settings service is initialized
-    app.use('/api/settings', (_req, res) => {
-      res.status(503).json({ error: 'Settings service initializing. Try again shortly.' });
-    });
-  }
+  // Settings route — mounted after PostgreSQL init. Placeholder returns 503 until ready.
+  app.use('/api/settings', (req, res, next) => {
+    if (modules.settingsService) {
+      // Forward to the real settings router
+      return createSettingsRouter(modules.settingsService)(req, res, next);
+    }
+    res.status(503).json({ error: 'Settings service initializing. Try again shortly.' });
+  });
 
   // System metrics endpoint (for dashboard ResourceWidget)
   app.get('/api/system/metrics', (req, res) => {

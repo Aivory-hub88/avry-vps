@@ -16,6 +16,18 @@ export function createJobsRouter(
   const router = Router();
 
   /**
+   * GET /api/jobs/concurrency
+   * Return concurrency limits for the job queue.
+   */
+  router.get('/concurrency', async (_req: Request, res: Response) => {
+    try {
+      res.json({ build: 2, deploy: 3, backup: 1, restore: 1, 'db-import': 1, 'db-export': 1, 'tunnel-transfer': 2 });
+    } catch (error: any) {
+      res.json({ build: 2, deploy: 3, backup: 1, restore: 1 });
+    }
+  });
+
+  /**
    * GET /api/jobs
    * List jobs with optional filtering.
    * Query params: type, projectId, status, limit, offset
