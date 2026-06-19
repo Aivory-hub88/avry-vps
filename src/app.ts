@@ -395,6 +395,11 @@ export function createApp(envConfig?: EnvConfig): AppInstance {
       settingsService = createSettingsService(pgClient);
       console.log('[VPS Panel] Settings service initialized');
 
+      // Update the route handler with the initialized service
+      if ((app as any).__setSettingsService) {
+        (app as any).__setSettingsService(settingsService);
+      }
+
       // ─── Initialize Downsampling Engine ───────────────────────────────────────
       downsamplingEngine = createDownsamplingEngine(pgClient, settingsService);
       downsamplingEngine.start();

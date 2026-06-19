@@ -109,14 +109,20 @@ export function registerRoutes(app: Express, modules: ModuleRegistry): void {
   app.use('/api/jobs', createJobsRouter(modules.jobQueue, auditLogger));
   app.use('/api/alerts', createAlertsRouter(modules.alertSystem, auditLogger));
 
-  // Settings route — mounted after PostgreSQL init. Placeholder returns 503 until ready.
+  // Settings route — uses a getter to check if settingsService is available
+  // (it gets initialized after PostgreSQL connects, which happens after routes are registered)
+  let _settingsService: SettingsService | null = (modules.settingsService as SettingsService | undefined) ?? null;
+  const setSettingsService = (svc: SettingsService) => { _settingsService = svc; };
+
   app.use('/api/settings', (req, res, next) => {
-    if (modules.settingsService) {
-      // Forward to the real settings router
-      return createSettingsRouter(modules.settingsService)(req, res, next);
+    if (_settingsService) {
+      return createSettingsRouter(_settingsService)(req, res, next);
     }
-    res.status(503).json({ error: 'Settings service initializing. Try again shortly.' });
+    res.status(503).json({ error: 'Settings service initializing. PostgreSQL may still be connecting.' });
   });
+
+  // Expose setter so app.ts can update it after PostgreSQL init
+  (app as any).__setSettingsService = setSettingsService;
 
   // System metrics endpoint (for dashboard ResourceWidget)
   app.get('/api/system/metrics', (req, res) => {
