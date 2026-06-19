@@ -77,6 +77,40 @@ export function createAuthRouter(authModule: AuthModule, auditLogger: AuditLogge
   });
 
   /**
+   * GET /api/auth/session
+   * Protected — validates the current session token and returns session info.
+   * Used by the frontend on page load to verify the stored token is still valid.
+   */
+  router.get('/session', async (req: Request, res: Response) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader) {
+        res.status(401).json({ error: 'No token provided' });
+        return;
+      }
+
+      const token = authHeader.replace('Bearer ', '');
+      const session = authModule.validateSession(token);
+
+      if (!session) {
+        res.status(401).json({ error: 'Invalid or expired session' });
+        return;
+      }
+
+      res.json({
+        session: {
+          id: session.id,
+          username: session.username,
+          createdAt: session.createdAt.toISOString(),
+          lastActivity: session.lastActivity.toISOString(),
+        },
+      });
+    } catch (error: any) {
+      res.status(401).json({ error: 'Session validation failed' });
+    }
+  });
+
+  /**
    * POST /api/auth/logout
    * Protected — invalidates the current session.
    */

@@ -81,6 +81,7 @@ export function registerRoutes(app: Express, modules: ModuleRegistry): void {
       '/health',
       '/login',
       '/auth/login',
+      '/auth/session',
       '/webhooks',
     ],
   });
