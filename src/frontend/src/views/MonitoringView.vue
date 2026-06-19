@@ -15,6 +15,7 @@ import {
 import { io, Socket } from 'socket.io-client';
 import { useMonitoringStore, type TimeRange, type TimeSeriesDataPointV2 } from '@/stores/monitoring';
 import { useContainersStore } from '@/stores/containers';
+import { useAuthStore } from '@/stores/auth';
 
 ChartJS.register(
   CategoryScale,
@@ -230,8 +231,10 @@ function retry(): void {
 }
 
 function connectSocket(): void {
+  const authStore = useAuthStore();
   socket = io(window.location.origin, {
     transports: ['websocket'],
+    auth: { token: authStore.token },
   });
 
   socket.on('resource:update', (point: TimeSeriesDataPointV2) => {

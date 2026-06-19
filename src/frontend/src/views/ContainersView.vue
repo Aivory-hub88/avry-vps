@@ -165,7 +165,10 @@ onMounted(() => {
   refreshInterval = setInterval(() => containersStore.fetchContainers(), 15000);
 
   // Connect Socket.IO for real-time resource updates
-  socket = io({ transports: ['websocket'] });
+  socket = io({
+    transports: ['websocket'],
+    auth: { token: authStore.token },
+  });
   socket.on('resource:update', (data: { containers?: Array<{ id: string; name: string; cpuPercent: number; memoryUsageMB: number; memoryLimitMB: number }> }) => {
     if (data.containers) {
       for (const c of data.containers) {
@@ -272,11 +275,11 @@ onUnmounted(() => {
             </div>
             <div class="info-row">
               <span class="info-label">CPU</span>
-              <span class="info-value">{{ detail.cpuPercent.toFixed(1) }}%</span>
+              <span class="info-value">{{ (detail.cpuPercent ?? 0).toFixed(1) }}%</span>
             </div>
             <div class="info-row">
               <span class="info-label">Memory</span>
-              <span class="info-value">{{ detail.memoryMB.toFixed(1) }} MB</span>
+              <span class="info-value">{{ (detail.memoryMB ?? 0).toFixed(1) }} MB</span>
             </div>
           </div>
 
