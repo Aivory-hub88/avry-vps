@@ -19,12 +19,12 @@ export function createAlertsRouter(
 
   /**
    * GET /api/alerts
-   * Return alert history (for dashboard compatibility).
+   * Return alert history in the shape the frontend expects.
    */
   router.get('/', async (req: Request, res: Response) => {
     try {
       const history = await alertSystem.getAlertHistory();
-      res.json(history);
+      res.json({ alerts: history, unreadCount: history.length });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }

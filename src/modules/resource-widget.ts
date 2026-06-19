@@ -407,8 +407,9 @@ export function createResourceWidget(
 
       latestUpdate = update;
       io.emit('resource:update', update);
-    } catch {
-      // Swallow errors during periodic collection to avoid crashing the loop
+    } catch (err) {
+      // Log errors during periodic collection
+      console.error('[ResourceWidget] Collection error:', err instanceof Error ? err.message : String(err));
     }
   }
 
