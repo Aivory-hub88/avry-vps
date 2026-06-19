@@ -65,6 +65,7 @@ export interface ModuleRegistry {
   securityManager: SecurityManager;
   jobQueue: JobQueue;
   alertSystem: AlertSystem;
+  resourceWidget: { getLatestUpdate(): any };
   settingsService?: SettingsService;
 }
 
@@ -126,7 +127,7 @@ export function registerRoutes(app: Express, modules: ModuleRegistry): void {
     const session = authModule.validateSession(token);
     if (!session) { res.status(401).json({ error: 'Invalid session' }); return; }
 
-    const resourceWidget = (modules as any).resourceWidget;
+    const resourceWidget = modules.resourceWidget;
     const update = resourceWidget?.getLatestUpdate?.() as any;
     if (update && update.system) {
       const sys = update.system;

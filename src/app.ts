@@ -769,6 +769,7 @@ export function createApp(envConfig?: EnvConfig): AppInstance {
     securityManager,
     jobQueue,
     alertSystem,
+    resourceWidget,
     ...(settingsService ? { settingsService } : {}),
   });
 
