@@ -14,6 +14,7 @@ const navItems = [
   { path: '/domains', label: 'Domains', icon: '🌐' },
   { path: '/jobs', label: 'Jobs', icon: '⚙️' },
   { path: '/alerts', label: 'Alerts', icon: '🔔' },
+  { path: '/settings', label: 'Settings', icon: '⚙️' },
 ];
 
 const sidebarCollapsed = ref(false);

@@ -1,1 +1,0 @@
-{"version":3,"file":"logs.d.ts","sourceRoot":"","sources":["../../src/socket/logs.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;GAWG;AACH,OAAO,KAAK,EAAE,MAAM,IAAI,cAAc,EAAE,MAAM,EAAE,MAAM,WAAW,CAAC;AAClE,OAAO,KAAK,EAAE,SAAS,EAAE,MAAM,0BAA0B,CAAC;AAc1D;;GAEG;AACH,wBAAgB,oBAAoB,CAClC,EAAE,EAAE,cAAc,EAClB,MAAM,EAAE,MAAM,EACd,SAAS,EAAE,SAAS,GACnB,IAAI,CAmEN"}

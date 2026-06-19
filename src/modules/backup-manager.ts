@@ -5,7 +5,11 @@
  * with support for local filesystem and S3-compatible storage, configurable
  * retention policy, backup history tracking, and restore functionality.
  *
- * Requirements: 17.1, 17.2, 17.3, 17.4, 17.5, 17.6, 17.7, 17.8
+ * Extended with container image snapshot, export, and restore capabilities
+ * using Dockerode commit/save operations.
+ *
+ * Requirements: 13.1, 13.2, 13.3, 13.4, 13.5, 13.6, 15.1, 15.2, 15.3, 15.4, 15.5,
+ *              17.1, 17.2, 17.3, 17.4, 17.5, 17.6, 17.7, 17.8
  */
 import type Database from 'better-sqlite3';
 import { v4 as uuidv4 } from 'uuid';
@@ -13,6 +17,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execSync, exec } from 'node:child_process';
 import { promisify } from 'node:util';
+import Dockerode from 'dockerode';
+import type { SettingsService } from '../services/settings-service.js';
 
 const execAsync = promisify(exec);
 
@@ -69,6 +75,47 @@ export interface BackupManager {
   stopScheduler(): void;
 }
 
+// ─── Extended Interfaces (Premium Upgrade) ──────────────────────────────────
+
+export interface SnapshotResult {
+  backupId: string;
+  imageTag: string;
+  containerId: string;
+  timestamp: string;
+}
+
+export interface ExportResult {
+  backupId: string;
+  archivePath: string;
+  size: number;
+  s3Uploaded: boolean;
+}
+
+export interface RestoreResult {
+  success: boolean;
+  safetySnapshotId: string;
+  newContainerId: string;
+  previousContainerId: string;
+}
+
+export interface SnapshotScheduleConfig {
+  targets: string[];
+  cronExpression: string;
+  retentionCount: number;
+  enabled: boolean;
+}
+
+export interface BackupManagerExtended extends BackupManager {
+  /** Create a snapshot of a running container (docker commit) */
+  snapshotContainer(containerId: string, commitMessage?: string): Promise<SnapshotResult>;
+  /** Export a Docker image as a tar archive */
+  exportImage(imageName: string): Promise<ExportResult>;
+  /** Restore a container from a backup snapshot */
+  restoreContainer(backupId: string, targetContainerName: string): Promise<RestoreResult>;
+  /** Configure snapshot schedule via settings */
+  updateScheduleFromSettings(scheduleConfig: SnapshotScheduleConfig): void;
+}
+
 export interface AlertCallback {
   onBackupFailure(backupId: string, error: string, targets: string[]): void;
 }
@@ -78,6 +125,10 @@ export interface BackupManagerConfig {
   workDir?: string;
   /** Alert callback for failure notifications */
   alertCallback?: AlertCallback;
+  /** Dockerode instance (optional, created with defaults if not provided) */
+  docker?: Dockerode;
+  /** Settings service for reading backup configuration */
+  settingsService?: SettingsService;
 }
 
 // ─── Internal Types ────────────────────────────────────────────────────────────
@@ -104,14 +155,63 @@ interface RawScheduleRow {
   created_at: string;
 }
 
+interface RawSnapshotBackupRow {
+  id: string;
+  schedule_id: string | null;
+  timestamp: string;
+  size: number | null;
+  targets: string | null;
+  storage_type: string | null;
+  storage_path: string | null;
+  status: string;
+  type: string;
+  container_id: string | null;
+  container_name: string | null;
+  image_tag: string | null;
+  commit_message: string | null;
+}
+
 // ─── Implementation ────────────────────────────────────────────────────────────
+
+/**
+ * Generate a snapshot tag in the format: {container_name}-snapshot-{YYYYMMDD-HHmmss}
+ * @param containerName - The Docker container name
+ * @param date - The timestamp for the tag
+ * @returns Formatted snapshot tag string
+ */
+export function generateSnapshotTag(containerName: string, date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
+
+  return `${containerName}-snapshot-${year}${month}${day}-${hours}${minutes}${seconds}`;
+}
+
+/**
+ * Format a date as YYYYMMDD-HHmmss string for file naming.
+ */
+export function formatTimestamp(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
+
+  return `${year}${month}${day}-${hours}${minutes}${seconds}`;
+}
 
 export function createBackupManager(
   db: Database.Database,
   config?: BackupManagerConfig
-): BackupManager {
+): BackupManagerExtended {
   const workDir = config?.workDir ?? '/tmp/vps-panel-backups';
   const alertCallback = config?.alertCallback;
+  const docker = config?.docker ?? new Dockerode();
+  const settingsService = config?.settingsService;
   let schedulerTimer: ReturnType<typeof setInterval> | null = null;
 
   // Ensure work directory exists
@@ -147,6 +247,25 @@ export function createBackupManager(
   );
 
   const getScheduleStmt = db.prepare(`SELECT * FROM backup_schedules WHERE id = ?`);
+
+  // ─── Premium Snapshot/Export Prepared Statements ────────────────────────────
+
+  const insertSnapshotBackupStmt = db.prepare(`
+    INSERT INTO backups (id, timestamp, type, container_id, container_name, image_tag, commit_message, status, targets, storage_type, storage_path)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 'local', '')
+  `);
+
+  const insertExportBackupStmt = db.prepare(`
+    INSERT INTO backups (id, timestamp, size, type, targets, storage_path, storage_type, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const getSnapshotBackupStmt = db.prepare(`SELECT * FROM backups WHERE id = ?`);
+
+  const insertRestoreHistoryStmt = db.prepare(`
+    INSERT INTO restore_history (id, backup_id, target_container, safety_snapshot_id, outcome, error_message, started_at, completed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
 
   // ─── configureSchedule ───────────────────────────────────────────────────
 
@@ -909,6 +1028,466 @@ export function createBackupManager(
     }
   }
 
+  // ─── Container Snapshot (Premium) ───────────────────────────────────────────
+
+  /**
+   * Create a snapshot of a running container via Docker commit.
+   * Tags the resulting image with format: {container_name}-snapshot-{YYYYMMDD-HHmmss}
+   *
+   * @param containerId - The Docker container ID to snapshot
+   * @param commitMessage - Optional commit message for the snapshot
+   * @returns SnapshotResult with backup ID, image tag, container ID, and timestamp
+   */
+  async function snapshotContainer(containerId: string, commitMessage?: string): Promise<SnapshotResult> {
+    const timestamp = new Date();
+    const backupId = uuidv4();
+
+    try {
+      // Get container info to determine name
+      const container = docker.getContainer(containerId);
+      const containerInfo = await container.inspect();
+      const containerName = containerInfo.Name.replace(/^\//, ''); // Remove leading slash
+
+      // Generate the snapshot tag: {container_name}-snapshot-{YYYYMMDD-HHmmss}
+      const imageTag = generateSnapshotTag(containerName, timestamp);
+
+      // Docker commit: create an image from the container state
+      const commitResult = await container.commit({
+        repo: imageTag,
+        tag: 'latest',
+        comment: commitMessage ?? `Snapshot of ${containerName}`,
+        author: 'VPS Panel Backup Manager',
+      });
+
+      // Track in backup registry
+      const timestampStr = timestamp.toISOString();
+      insertSnapshotBackupStmt.run(
+        backupId,
+        timestampStr,
+        'snapshot',
+        containerId,
+        containerName,
+        imageTag,
+        commitMessage ?? null,
+        'completed'
+      );
+
+      return {
+        backupId,
+        imageTag,
+        containerId,
+        timestamp: timestampStr,
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      // Track the failed snapshot in registry
+      insertSnapshotBackupStmt.run(
+        backupId,
+        timestamp.toISOString(),
+        'snapshot',
+        containerId,
+        '',
+        '',
+        commitMessage ?? null,
+        'failed'
+      );
+
+      throw new Error(`Docker commit failed for container ${containerId}: ${errorMessage}`);
+    }
+  }
+
+  // ─── Image Export (Premium) ────────────────────────────────────────────────
+
+  /**
+   * Export a Docker image as a tar archive to the configured backup path.
+   * Optionally uploads to S3 when backup_s3_enabled is true.
+   *
+   * @param imageName - The Docker image name/tag to export
+   * @returns ExportResult with backup ID, archive path, size, and S3 upload status
+   */
+  async function exportImage(imageName: string): Promise<ExportResult> {
+    const backupId = uuidv4();
+    const timestamp = new Date();
+    let archivePath = '';
+    let s3Uploaded = false;
+
+    try {
+      // Determine local backup path from settings or default
+      const backupLocalPath = settingsService
+        ? await settingsService.get('backup_local_path')
+        : '/data/backups';
+
+      // Ensure backup directory exists
+      if (!fs.existsSync(backupLocalPath)) {
+        fs.mkdirSync(backupLocalPath, { recursive: true });
+      }
+
+      // Generate archive filename
+      const safeImageName = imageName.replace(/[/:]/g, '-');
+      const archiveName = `${safeImageName}-${formatTimestamp(timestamp)}.tar`;
+      archivePath = path.join(backupLocalPath, archiveName);
+
+      // Get the Docker image and save as tar
+      const image = docker.getImage(imageName);
+      const stream = await image.get();
+
+      // Write stream to file
+      await new Promise<void>((resolve, reject) => {
+        const writeStream = fs.createWriteStream(archivePath);
+        stream.pipe(writeStream);
+        writeStream.on('finish', resolve);
+        writeStream.on('error', reject);
+        stream.on('error', reject);
+      });
+
+      // Get file size
+      const stat = fs.statSync(archivePath);
+      const archiveSize = stat.size;
+
+      // Attempt S3 upload if enabled
+      if (settingsService) {
+        const s3Enabled = await settingsService.get('backup_s3_enabled');
+        if (s3Enabled === 'true') {
+          try {
+            await uploadExportToS3(archivePath, archiveName);
+            s3Uploaded = true;
+          } catch (s3Error) {
+            // S3 upload failed: retain local copy, log failure, emit alert
+            const s3ErrorMsg = s3Error instanceof Error ? s3Error.message : String(s3Error);
+            console.error(`S3 upload failed for ${archiveName}: ${s3ErrorMsg}`);
+
+            if (alertCallback) {
+              alertCallback.onBackupFailure(backupId, `S3 upload failed: ${s3ErrorMsg}`, [imageName]);
+            }
+            // Local copy is retained — s3Uploaded remains false
+          }
+        }
+      }
+
+      // Track in backup registry
+      const storageLocation = s3Uploaded ? `s3+local:${archivePath}` : `local:${archivePath}`;
+      insertExportBackupStmt.run(
+        backupId,
+        timestamp.toISOString(),
+        archiveSize,
+        'export',
+        imageName,
+        archivePath,
+        storageLocation,
+        'completed'
+      );
+
+      return {
+        backupId,
+        archivePath,
+        size: archiveSize,
+        s3Uploaded,
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      // Clean up partial tar file if it exists
+      if (archivePath && fs.existsSync(archivePath)) {
+        try {
+          fs.unlinkSync(archivePath);
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
+
+      // Track the failed export in registry
+      insertExportBackupStmt.run(
+        backupId,
+        timestamp.toISOString(),
+        0,
+        'export',
+        imageName,
+        '',
+        '',
+        'failed'
+      );
+
+      throw new Error(`Docker save failed for image ${imageName}: ${errorMessage}`);
+    }
+  }
+
+  // ─── S3 Upload for Exports (Premium) ──────────────────────────────────────
+
+  async function uploadExportToS3(localFilePath: string, fileName: string): Promise<string> {
+    if (!settingsService) {
+      throw new Error('Settings service not available for S3 configuration');
+    }
+
+    const endpoint = await settingsService.get('backup_s3_endpoint');
+    const bucket = await settingsService.get('backup_s3_bucket');
+    const accessKey = await settingsService.get('backup_s3_access_key');
+    const secretKey = await settingsService.get('backup_s3_secret_key');
+    const region = await settingsService.get('backup_s3_region');
+    const prefix = await settingsService.get('backup_s3_prefix');
+
+    if (!bucket) {
+      throw new Error('S3 bucket not configured');
+    }
+
+    let S3Client: any;
+    let PutObjectCommand: any;
+    try {
+      const s3Module = await import('@aws-sdk/client-s3');
+      S3Client = s3Module.S3Client;
+      PutObjectCommand = s3Module.PutObjectCommand;
+    } catch {
+      throw new Error(
+        'S3 storage is not available. Install @aws-sdk/client-s3 to enable S3 backup support.'
+      );
+    }
+
+    const client = new S3Client({
+      endpoint: endpoint || undefined,
+      region: region || 'us-east-1',
+      credentials: {
+        accessKeyId: accessKey,
+        secretAccessKey: secretKey,
+      },
+      forcePathStyle: true,
+    });
+
+    const fileContent = fs.readFileSync(localFilePath);
+    const key = prefix ? `${prefix}/${fileName}` : fileName;
+
+    await client.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: fileContent,
+        ContentType: 'application/x-tar',
+      })
+    );
+
+    return `s3://${bucket}/${key}`;
+  }
+
+  // ─── Container Restore (Premium) ──────────────────────────────────────────
+
+  /**
+   * Restore a container from a backup snapshot.
+   * Creates safety snapshot first, stops target, creates new container from image.
+   */
+  async function restoreContainer(backupId: string, targetContainerName: string): Promise<RestoreResult> {
+    // Look up the backup entry
+    const backupRow = getSnapshotBackupStmt.get(backupId) as RawSnapshotBackupRow | undefined;
+    if (!backupRow) {
+      throw new Error(`Backup not found: ${backupId}`);
+    }
+
+    if (backupRow.status !== 'completed') {
+      throw new Error(`Cannot restore from backup with status: ${backupRow.status}`);
+    }
+
+    if (backupRow.type !== 'snapshot') {
+      throw new Error(`Cannot restore from backup type: ${backupRow.type}. Only snapshot backups support restore.`);
+    }
+
+    // Find the target container
+    const containers = await docker.listContainers({ all: true });
+    const targetContainer = containers.find(
+      (c) => c.Names.some((n) => n.replace(/^\//, '') === targetContainerName)
+    );
+
+    if (!targetContainer) {
+      throw new Error(`Target container not found: ${targetContainerName}`);
+    }
+
+    const previousContainerId = targetContainer.Id;
+    let safetySnapshotId = '';
+    let newContainerId = '';
+
+    try {
+      // Step 1: Create safety snapshot of the current state
+      const safetyResult = await snapshotContainer(
+        previousContainerId,
+        `Safety snapshot before restore from backup ${backupId}`
+      );
+      safetySnapshotId = safetyResult.backupId;
+
+      // Step 2: Stop the target container
+      const container = docker.getContainer(previousContainerId);
+      const containerInfo = await container.inspect();
+      await container.stop();
+
+      // Step 3: Create new container from the snapshot image with same configuration
+      const imageTag = backupRow.image_tag;
+      const newContainer = await docker.createContainer({
+        name: targetContainerName + '-restored',
+        Image: `${imageTag}:latest`,
+        Env: containerInfo.Config.Env ?? [],
+        ExposedPorts: containerInfo.Config.ExposedPorts ?? {},
+        HostConfig: {
+          PortBindings: containerInfo.HostConfig?.PortBindings ?? {},
+          Binds: containerInfo.HostConfig?.Binds ?? [],
+          RestartPolicy: containerInfo.HostConfig?.RestartPolicy ?? { Name: 'no' },
+          NetworkMode: containerInfo.HostConfig?.NetworkMode ?? 'bridge',
+        },
+      });
+
+      // Step 4: Start the new container
+      await newContainer.start();
+      const newContainerInfo = await newContainer.inspect();
+      newContainerId = newContainerInfo.Id;
+
+      // Step 5: Remove old container
+      await container.remove();
+
+      // Rename restored container to original name
+      await newContainer.rename({ name: targetContainerName });
+
+      // Record restore in history
+      insertRestoreHistoryStmt.run(
+        uuidv4(),
+        backupId,
+        targetContainerName,
+        safetySnapshotId,
+        'success',
+        null,
+        new Date().toISOString(),
+        new Date().toISOString()
+      );
+
+      return {
+        success: true,
+        safetySnapshotId,
+        newContainerId,
+        previousContainerId,
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      // Attempt to restart the original container
+      try {
+        const originalContainer = docker.getContainer(previousContainerId);
+        await originalContainer.start();
+      } catch {
+        // Original container restart may also fail
+      }
+
+      // Record failed restore in history
+      insertRestoreHistoryStmt.run(
+        uuidv4(),
+        backupId,
+        targetContainerName,
+        safetySnapshotId,
+        'failed',
+        errorMessage,
+        new Date().toISOString(),
+        new Date().toISOString()
+      );
+
+      throw new Error(`Restore failed for container ${targetContainerName}: ${errorMessage}`);
+    }
+  }
+
+  // ─── Schedule from Settings (Premium) ─────────────────────────────────────
+
+  let snapshotScheduleTimer: ReturnType<typeof setInterval> | null = null;
+  let currentScheduleConfig: SnapshotScheduleConfig | null = null;
+
+  function updateScheduleFromSettings(scheduleConfig: SnapshotScheduleConfig): void {
+    currentScheduleConfig = scheduleConfig;
+
+    // Clear existing schedule timer
+    if (snapshotScheduleTimer) {
+      clearInterval(snapshotScheduleTimer);
+      snapshotScheduleTimer = null;
+    }
+
+    if (!scheduleConfig.enabled) {
+      return;
+    }
+
+    // Set up scheduled check (every minute, like the existing scheduler)
+    snapshotScheduleTimer = setInterval(() => {
+      if (currentScheduleConfig?.enabled && shouldRunSchedule(currentScheduleConfig.cronExpression, new Date())) {
+        runScheduledSnapshots();
+      }
+    }, 60_000);
+
+    if (snapshotScheduleTimer.unref) {
+      snapshotScheduleTimer.unref();
+    }
+  }
+
+  async function runScheduledSnapshots(): Promise<void> {
+    if (!currentScheduleConfig) return;
+
+    for (const target of currentScheduleConfig.targets) {
+      try {
+        // Find container by name
+        const containers = await docker.listContainers({ all: true });
+        const containerMatch = containers.find(
+          (c) => c.Names.some((n) => n.replace(/^\//, '') === target)
+        );
+
+        if (containerMatch) {
+          await snapshotContainer(containerMatch.Id, `Scheduled snapshot`);
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        // Emit alert but continue with remaining containers
+        if (alertCallback) {
+          alertCallback.onBackupFailure('', `Scheduled snapshot failed for ${target}: ${errorMessage}`, [target]);
+        }
+      }
+    }
+
+    // Enforce retention count
+    if (currentScheduleConfig.retentionCount > 0) {
+      enforceSnapshotRetention(currentScheduleConfig.retentionCount);
+    }
+  }
+
+  function enforceSnapshotRetention(retentionCount: number): void {
+    // Get all completed snapshots per container, enforce retention per container
+    const completedSnapshots = db
+      .prepare(
+        `SELECT * FROM backups WHERE type = 'snapshot' AND status = 'completed' ORDER BY timestamp DESC`
+      )
+      .all() as RawSnapshotBackupRow[];
+
+    // Group by container_name
+    const byContainer = new Map<string, RawSnapshotBackupRow[]>();
+    for (const snap of completedSnapshots) {
+      const name = snap.container_name || 'unknown';
+      if (!byContainer.has(name)) {
+        byContainer.set(name, []);
+      }
+      byContainer.get(name)!.push(snap);
+    }
+
+    // For each container, delete excess snapshots
+    for (const [, snapshots] of byContainer) {
+      if (snapshots.length > retentionCount) {
+        const toDelete = snapshots.slice(retentionCount);
+        for (const snap of toDelete) {
+          // Remove Docker image if possible
+          try {
+            if (snap.image_tag) {
+              const image = docker.getImage(`${snap.image_tag}:latest`);
+              image.remove().catch(() => {
+                // Image may already be removed or in use
+              });
+            }
+          } catch {
+            // Ignore image removal errors
+          }
+          // Remove from registry
+          deleteBackupStmt.run(snap.id);
+        }
+      }
+    }
+  }
+
+  // ─── Snapshot Tag Helper ──────────────────────────────────────────────────
+
   // ─── Return the public API ─────────────────────────────────────────────────
 
   return {
@@ -919,5 +1498,10 @@ export function createBackupManager(
     deleteBackup,
     startScheduler,
     stopScheduler,
+    // Premium extensions
+    snapshotContainer,
+    exportImage,
+    restoreContainer,
+    updateScheduleFromSettings,
   };
 }

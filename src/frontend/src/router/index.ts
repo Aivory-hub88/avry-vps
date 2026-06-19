@@ -104,6 +104,17 @@ const routes: RouteRecordRaw[] = [
     name: 'security',
     component: () => import('@/views/SecurityView.vue'),
   },
+  {
+    path: '/monitoring',
+    name: 'monitoring',
+    component: () => import('@/views/MonitoringView.vue'),
+  },
+  {
+    path: '/settings',
+    name: 'settings',
+    component: () => import('@/views/SettingsView.vue'),
+    meta: { requiresAdmin: true },
+  },
 ];
 
 export const router = createRouter({
@@ -111,7 +122,7 @@ export const router = createRouter({
   routes,
 });
 
-router.beforeEach((to) => {
+router.beforeEach(async (to) => {
   const authStore = useAuthStore();
 
   if (to.meta.requiresAuth === false) {
@@ -120,6 +131,14 @@ router.beforeEach((to) => {
 
   if (!authStore.isAuthenticated) {
     return { name: 'login' };
+  }
+
+  // On first navigation after refresh, validate the session is still valid server-side
+  if (!authStore.session && authStore.token) {
+    await authStore.checkSession();
+    if (!authStore.isAuthenticated) {
+      return { name: 'login' };
+    }
   }
 
   return true;

@@ -2,7 +2,9 @@
  * Alert Routes
  *
  * Endpoints for alert system management:
- * configure channels, configure rules, history.
+ * configure channels, configure rules, history, acknowledgment, silencing.
+ *
+ * @validates Requirements 11.2, 11.3, 11.4
  */
 import { Router } from 'express';
 import type { Request, Response } from 'express';
@@ -171,13 +173,143 @@ export function createAlertsRouter(
 
   /**
    * GET /api/alerts/history
-   * Get alert history.
+   * Get paginated alert history.
+   * Query params: page (default 1), pageSize (default 20)
+   * @validates Requirements 11.2
    */
   router.get('/history', async (req: Request, res: Response) => {
     try {
-      const history = await alertSystem.getAlertHistory();
-      res.json(history);
+      const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+      const parsedPageSize = parseInt(req.query.pageSize as string, 10);
+      const pageSize = Math.min(100, Math.max(1, Number.isNaN(parsedPageSize) ? 20 : parsedPageSize));
+
+      const result = await alertSystem.getAlertHistoryPaginated(page, pageSize);
+      res.json(result);
     } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
+   * POST /api/alerts/:id/acknowledge
+   * Acknowledge an alert by ID.
+   * Body: { adminId: string }
+   * @validates Requirements 11.3
+   */
+  router.post('/:id/acknowledge', async (req: Request, res: Response) => {
+    try {
+      const alertId = req.params.id;
+      const { adminId } = req.body;
+
+      if (!adminId || typeof adminId !== 'string') {
+        res.status(400).json({ error: 'adminId is required and must be a string' });
+        return;
+      }
+
+      await alertSystem.acknowledgeAlert(alertId, adminId);
+
+      await auditLogger.log({
+        actor: req.session?.username ?? adminId,
+        actionType: 'alert.acknowledge',
+        targetResource: `alert:${alertId}`,
+        details: { adminId },
+        sourceIp: req.ip ?? req.socket.remoteAddress ?? 'unknown',
+        result: 'success',
+      });
+
+      res.json({ message: 'Alert acknowledged', id: alertId });
+    } catch (error: any) {
+      await auditLogger.log({
+        actor: req.session?.username ?? 'unknown',
+        actionType: 'alert.acknowledge',
+        targetResource: `alert:${req.params.id}`,
+        details: { error: error.message },
+        sourceIp: req.ip ?? req.socket.remoteAddress ?? 'unknown',
+        result: 'failure',
+      });
+
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
+   * POST /api/alerts/rules/:id/silence
+   * Silence an alert rule for a specified duration.
+   * Body: { durationMs: number, adminId: string }
+   * @validates Requirements 11.4
+   */
+  router.post('/rules/:id/silence', async (req: Request, res: Response) => {
+    try {
+      const ruleId = req.params.id;
+      const { durationMs, adminId } = req.body;
+
+      if (!adminId || typeof adminId !== 'string') {
+        res.status(400).json({ error: 'adminId is required and must be a string' });
+        return;
+      }
+
+      if (durationMs === undefined || typeof durationMs !== 'number' || durationMs <= 0) {
+        res.status(400).json({ error: 'durationMs is required and must be a positive number' });
+        return;
+      }
+
+      const silenceId = await alertSystem.silenceRule(ruleId, durationMs, adminId);
+
+      await auditLogger.log({
+        actor: req.session?.username ?? adminId,
+        actionType: 'alert.silence-rule',
+        targetResource: `alert-rule:${ruleId}`,
+        details: { durationMs, silenceId },
+        sourceIp: req.ip ?? req.socket.remoteAddress ?? 'unknown',
+        result: 'success',
+      });
+
+      res.json({ message: 'Rule silenced', silenceId, ruleId });
+    } catch (error: any) {
+      await auditLogger.log({
+        actor: req.session?.username ?? 'unknown',
+        actionType: 'alert.silence-rule',
+        targetResource: `alert-rule:${req.params.id}`,
+        details: { error: error.message },
+        sourceIp: req.ip ?? req.socket.remoteAddress ?? 'unknown',
+        result: 'failure',
+      });
+
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
+   * DELETE /api/alerts/silences/:id
+   * Remove an active silence by ID.
+   * @validates Requirements 11.4
+   */
+  router.delete('/silences/:id', async (req: Request, res: Response) => {
+    try {
+      const silenceId = req.params.id;
+
+      await alertSystem.removeSilence(silenceId);
+
+      await auditLogger.log({
+        actor: req.session?.username ?? 'unknown',
+        actionType: 'alert.remove-silence',
+        targetResource: `alert-silence:${silenceId}`,
+        details: {},
+        sourceIp: req.ip ?? req.socket.remoteAddress ?? 'unknown',
+        result: 'success',
+      });
+
+      res.json({ message: 'Silence removed', id: silenceId });
+    } catch (error: any) {
+      await auditLogger.log({
+        actor: req.session?.username ?? 'unknown',
+        actionType: 'alert.remove-silence',
+        targetResource: `alert-silence:${req.params.id}`,
+        details: { error: error.message },
+        sourceIp: req.ip ?? req.socket.remoteAddress ?? 'unknown',
+        result: 'failure',
+      });
+
       res.status(500).json({ error: error.message });
     }
   });

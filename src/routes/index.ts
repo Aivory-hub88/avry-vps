@@ -15,7 +15,7 @@ import type { DomainManager } from '../modules/domain-manager.js';
 import type { SSLManager } from '../modules/ssl-manager.js';
 import type { CronManager } from '../modules/cron-manager.js';
 import type { DatabaseManager } from '../modules/database-manager.js';
-import type { BackupManager } from '../modules/backup-manager.js';
+import type { BackupManagerExtended } from '../modules/backup-manager.js';
 import type { ProjectManager } from '../modules/project-manager.js';
 import type { BuildPipeline } from '../modules/build-pipeline.js';
 import type { WebhookHandler } from '../modules/webhook-handler.js';
@@ -24,6 +24,7 @@ import type { CICDBridge } from '../modules/cicd-bridge.js';
 import type { SecurityManager } from '../modules/security-manager.js';
 import type { JobQueue } from '../modules/job-queue.js';
 import type { AlertSystem } from '../modules/alert-system.js';
+import type { SettingsService } from '../services/settings-service.js';
 
 import { createAuthRouter } from './auth.js';
 import { createContainersRouter } from './containers.js';
@@ -42,6 +43,7 @@ import { createSecurityRouter } from './security.js';
 import { createAuditRouter } from './audit.js';
 import { createJobsRouter } from './jobs.js';
 import { createAlertsRouter } from './alerts.js';
+import { createSettingsRouter } from './settings.js';
 
 import { createAuthMiddleware } from '../middleware/auth.js';
 
@@ -54,7 +56,7 @@ export interface ModuleRegistry {
   sslManager: SSLManager;
   cronManager: CronManager;
   databaseManager: DatabaseManager;
-  backupManager: BackupManager;
+  backupManager: BackupManagerExtended;
   projectManager: ProjectManager;
   buildPipeline: BuildPipeline;
   webhookHandler: WebhookHandler;
@@ -63,6 +65,7 @@ export interface ModuleRegistry {
   securityManager: SecurityManager;
   jobQueue: JobQueue;
   alertSystem: AlertSystem;
+  settingsService?: SettingsService;
 }
 
 /**
@@ -103,4 +106,7 @@ export function registerRoutes(app: Express, modules: ModuleRegistry): void {
   app.use('/api/audit', createAuditRouter(auditLogger));
   app.use('/api/jobs', createJobsRouter(modules.jobQueue, auditLogger));
   app.use('/api/alerts', createAlertsRouter(modules.alertSystem, auditLogger));
+  if (modules.settingsService) {
+    app.use('/api/settings', createSettingsRouter(modules.settingsService));
+  }
 }

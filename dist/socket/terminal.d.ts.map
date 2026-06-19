@@ -1,1 +1,0 @@
-{"version":3,"file":"terminal.d.ts","sourceRoot":"","sources":["../../src/socket/terminal.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;;;GAaG;AACH,OAAO,KAAK,EAAE,MAAM,IAAI,cAAc,EAAE,MAAM,EAAE,MAAM,WAAW,CAAC;AAClE,OAAO,KAAK,EAAE,eAAe,EAAE,MAAM,gCAAgC,CAAC;AA8BtE;;GAEG;AACH,wBAAgB,wBAAwB,CACtC,EAAE,EAAE,cAAc,EAClB,MAAM,EAAE,MAAM,EACd,eAAe,EAAE,eAAe,GAC/B,IAAI,CAiGN"}

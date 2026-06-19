@@ -45,17 +45,25 @@ const isDirectRun =
 if (isDirectRun && !process.env.VITEST) {
   const instance = createApp();
 
-  // Start background services
-  instance.startBackgroundServices();
+  // Initialize PostgreSQL and run migrations before starting
+  instance.initializePostgres()
+    .then(() => {
+      // Start background services
+      instance.startBackgroundServices();
 
-  // Listen
-  instance.httpServer.listen(instance.config.PORT, () => {
-    console.log(
-      `[VPS Panel] Server listening on port ${instance.config.PORT} (${instance.config.ENVIRONMENT})`
-    );
-    console.log(`[VPS Panel] Docker host: ${instance.config.DOCKER_HOST}`);
-    console.log(`[VPS Panel] Degradation status:`, instance.degradation);
-  });
+      // Listen
+      instance.httpServer.listen(instance.config.PORT, () => {
+        console.log(
+          `[VPS Panel] Server listening on port ${instance.config.PORT} (${instance.config.ENVIRONMENT})`
+        );
+        console.log(`[VPS Panel] Docker host: ${instance.config.DOCKER_HOST}`);
+        console.log(`[VPS Panel] Degradation status:`, instance.degradation);
+      });
+    })
+    .catch((error) => {
+      console.error('[VPS Panel] Failed to initialize PostgreSQL:', error);
+      process.exit(1);
+    });
 
   // Graceful shutdown on signals
   process.on('SIGTERM', () => {

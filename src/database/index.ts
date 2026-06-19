@@ -25,7 +25,7 @@ export interface HealthCheckResult {
 }
 
 /** Current schema version. Increment when schema changes. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 3;
 
 /**
  * Get the resolved database file path from config or environment.
@@ -434,8 +434,13 @@ export function applyMigrations(db: Database.Database): void {
     applyMigrationV1(db);
   }
 
-  // Future migrations go here:
-  // if (currentVersion < 2) { applyMigrationV2(db); }
+  if (currentVersion < 2) {
+    applyMigrationV2(db);
+  }
+
+  if (currentVersion < 3) {
+    applyMigrationV3(db);
+  }
 }
 
 /**
@@ -466,6 +471,118 @@ function applyMigrationV1(db: Database.Database): void {
     db.prepare(
       'INSERT INTO schema_migrations (version, description) VALUES (?, ?)'
     ).run(1, 'Initial schema - all tables, indexes, FTS5, and default concurrency limits');
+  })();
+}
+
+/**
+ * Migration V2: Premium upgrade schema extensions for alerts and backups.
+ *
+ * - Adds acknowledgment and resolution columns to `alerts` table
+ * - Creates `alert_silences` table for suppressing alert notifications
+ * - Adds container snapshot columns to `backups` table
+ * - Creates `restore_history` table for tracking container restore operations
+ *
+ * @validates Requirements 11.1, 11.4, 13.2, 16.5
+ */
+function applyMigrationV2(db: Database.Database): void {
+  db.transaction(() => {
+    // Alert acknowledgment and resolution tracking
+    db.exec(`ALTER TABLE alerts ADD COLUMN acknowledged_at TEXT`);
+    db.exec(`ALTER TABLE alerts ADD COLUMN acknowledged_by TEXT`);
+    db.exec(`ALTER TABLE alerts ADD COLUMN resolved_at TEXT`);
+    db.exec(`ALTER TABLE alerts ADD COLUMN resolution_status TEXT DEFAULT 'active'
+      CHECK (resolution_status IN ('active', 'acknowledged', 'resolved', 'silenced'))`);
+
+    // Alert silences table
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS alert_silences (
+        id TEXT PRIMARY KEY,
+        rule_id TEXT NOT NULL,
+        admin_id TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (rule_id) REFERENCES alert_rules(id)
+      )
+    `);
+
+    // Backup registry extension for container snapshots
+    db.exec(`ALTER TABLE backups ADD COLUMN type TEXT DEFAULT 'volume'
+      CHECK (type IN ('volume', 'snapshot', 'export'))`);
+    db.exec(`ALTER TABLE backups ADD COLUMN container_id TEXT`);
+    db.exec(`ALTER TABLE backups ADD COLUMN container_name TEXT`);
+    db.exec(`ALTER TABLE backups ADD COLUMN image_tag TEXT`);
+    db.exec(`ALTER TABLE backups ADD COLUMN commit_message TEXT`);
+
+    // Restore history table
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS restore_history (
+        id TEXT PRIMARY KEY,
+        backup_id TEXT NOT NULL,
+        target_container TEXT NOT NULL,
+        safety_snapshot_id TEXT,
+        outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failed', 'rolled_back')),
+        error_message TEXT,
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT,
+        FOREIGN KEY (backup_id) REFERENCES backups(id)
+      )
+    `);
+
+    // Record migration
+    db.prepare(
+      'INSERT INTO schema_migrations (version, description) VALUES (?, ?)'
+    ).run(2, 'Premium upgrade - alert acknowledgment/silences, backup snapshots, restore history');
+  })();
+}
+
+/**
+ * Migration V3: Admin users table with database-stored credentials.
+ *
+ * Creates `admin_users` table and seeds default admin accounts.
+ * This replaces the env-var-only approach with proper DB-backed auth.
+ */
+function applyMigrationV3(db: Database.Database): void {
+  db.transaction(() => {
+    // Admin users table
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS admin_users (
+        id TEXT PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        display_name TEXT,
+        role TEXT NOT NULL DEFAULT 'admin' CHECK (role IN ('admin', 'viewer')),
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_admin_users_username ON admin_users(username)`);
+
+    // Seed default admin users
+    const seedUser = db.prepare(`
+      INSERT OR IGNORE INTO admin_users (id, username, password_hash, display_name, role)
+      VALUES (?, ?, ?, ?, 'admin')
+    `);
+
+    seedUser.run(
+      'usr_clement_001',
+      'clement.hansel@aivory.id',
+      '$2b$10$VeUSLUwzcb3mMj.IV6ns.OIFcexhO24HO9S2wL/kW3nCDzpmHTVpq',
+      'Clement Hansel'
+    );
+
+    seedUser.run(
+      'usr_aivory_001',
+      'aivory.admin',
+      '$2b$10$0Q7eRJJlEhE1LAOLG8Y0DO6Uhtew1EmP0cgDgDo3KHWrHu83Vtu7u',
+      'Aivory Admin'
+    );
+
+    // Record migration
+    db.prepare(
+      'INSERT INTO schema_migrations (version, description) VALUES (?, ?)'
+    ).run(3, 'Admin users table with seeded credentials');
   })();
 }
 

@@ -1,1 +1,0 @@
-{"version":3,"file":"jobs.d.ts","sourceRoot":"","sources":["../../src/socket/jobs.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;GAWG;AACH,OAAO,KAAK,EAAE,MAAM,IAAI,cAAc,EAAE,MAAM,EAAE,MAAM,WAAW,CAAC;AAClE,OAAO,KAAK,EAAE,QAAQ,EAAE,MAAM,yBAAyB,CAAC;AAcxD;;GAEG;AACH,wBAAgB,oBAAoB,CAClC,EAAE,EAAE,cAAc,EAClB,MAAM,EAAE,MAAM,EACd,QAAQ,EAAE,QAAQ,GACjB,IAAI,CA8DN"}

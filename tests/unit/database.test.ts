@@ -177,10 +177,10 @@ describe('Database Module', () => {
   });
 
   describe('applyMigrations', () => {
-    it('should set schema version to 1 after initial migration', () => {
+    it('should set schema version to latest after all migrations', () => {
       const db = initializeDatabase({ dbPath });
       const version = getCurrentSchemaVersion(db);
-      expect(version).toBe(1);
+      expect(version).toBe(2);
       closeDatabase(db);
     });
 
@@ -309,6 +309,205 @@ describe('Database Module', () => {
         .prepare("SELECT * FROM audit_log_fts WHERE audit_log_fts MATCH 'container'")
         .all();
       expect(results.length).toBeGreaterThanOrEqual(1);
+
+      closeDatabase(db);
+    });
+  });
+
+  describe('Migration V2: Premium upgrade schema extensions', () => {
+    it('should add acknowledgment columns to alerts table', () => {
+      const db = initializeDatabase({ dbPath });
+
+      // Verify columns exist by inserting an alert with the new columns
+      db.prepare(
+        "INSERT INTO alert_rules (id, resource_type, threshold) VALUES ('rule-1', 'cpu', 80)"
+      ).run();
+      db.prepare(
+        "INSERT INTO alerts (id, event_type, affected_resource, severity, acknowledged_at, acknowledged_by, resolved_at, resolution_status) VALUES ('alert-1', 'threshold_breach', 'system:cpu', 'warning', '2024-01-01T00:00:00Z', 'admin-user', NULL, 'acknowledged')"
+      ).run();
+
+      const alert = db.prepare("SELECT * FROM alerts WHERE id = 'alert-1'").get() as Record<string, unknown>;
+      expect(alert.acknowledged_at).toBe('2024-01-01T00:00:00Z');
+      expect(alert.acknowledged_by).toBe('admin-user');
+      expect(alert.resolved_at).toBeNull();
+      expect(alert.resolution_status).toBe('acknowledged');
+
+      closeDatabase(db);
+    });
+
+    it('should enforce resolution_status CHECK constraint on alerts', () => {
+      const db = initializeDatabase({ dbPath });
+
+      expect(() => {
+        db.prepare(
+          "INSERT INTO alerts (id, event_type, affected_resource, severity, resolution_status) VALUES ('alert-2', 'threshold_breach', 'system:cpu', 'warning', 'invalid_status')"
+        ).run();
+      }).toThrow();
+
+      closeDatabase(db);
+    });
+
+    it('should default resolution_status to active', () => {
+      const db = initializeDatabase({ dbPath });
+
+      db.prepare(
+        "INSERT INTO alerts (id, event_type, affected_resource, severity) VALUES ('alert-3', 'threshold_breach', 'system:cpu', 'warning')"
+      ).run();
+
+      const alert = db.prepare("SELECT resolution_status FROM alerts WHERE id = 'alert-3'").get() as { resolution_status: string };
+      expect(alert.resolution_status).toBe('active');
+
+      closeDatabase(db);
+    });
+
+    it('should create alert_silences table with correct schema', () => {
+      const db = initializeDatabase({ dbPath });
+
+      const tables = listTables(db);
+      expect(tables).toContain('alert_silences');
+
+      // Insert a silence record
+      db.prepare(
+        "INSERT INTO alert_rules (id, resource_type, threshold) VALUES ('rule-1', 'cpu', 80)"
+      ).run();
+      db.prepare(
+        "INSERT INTO alert_silences (id, rule_id, admin_id, expires_at) VALUES ('silence-1', 'rule-1', 'admin-1', '2024-12-31T23:59:59Z')"
+      ).run();
+
+      const silence = db.prepare("SELECT * FROM alert_silences WHERE id = 'silence-1'").get() as Record<string, unknown>;
+      expect(silence.rule_id).toBe('rule-1');
+      expect(silence.admin_id).toBe('admin-1');
+      expect(silence.expires_at).toBe('2024-12-31T23:59:59Z');
+      expect(silence.created_at).toBeDefined();
+
+      closeDatabase(db);
+    });
+
+    it('should enforce foreign key on alert_silences.rule_id', () => {
+      const db = initializeDatabase({ dbPath });
+
+      expect(() => {
+        db.prepare(
+          "INSERT INTO alert_silences (id, rule_id, admin_id, expires_at) VALUES ('silence-2', 'nonexistent-rule', 'admin-1', '2024-12-31T23:59:59Z')"
+        ).run();
+      }).toThrow();
+
+      closeDatabase(db);
+    });
+
+    it('should add container snapshot columns to backups table', () => {
+      const db = initializeDatabase({ dbPath });
+
+      db.prepare(
+        "INSERT INTO backups (id, targets, storage_type, storage_path, status, type, container_id, container_name, image_tag, commit_message) VALUES ('backup-1', 'nginx', 'local', '/data/backups/backup-1.tar', 'completed', 'snapshot', 'abc123', 'my-nginx', 'my-nginx-snapshot-20240101-120000', 'Pre-deploy snapshot')"
+      ).run();
+
+      const backup = db.prepare("SELECT * FROM backups WHERE id = 'backup-1'").get() as Record<string, unknown>;
+      expect(backup.type).toBe('snapshot');
+      expect(backup.container_id).toBe('abc123');
+      expect(backup.container_name).toBe('my-nginx');
+      expect(backup.image_tag).toBe('my-nginx-snapshot-20240101-120000');
+      expect(backup.commit_message).toBe('Pre-deploy snapshot');
+
+      closeDatabase(db);
+    });
+
+    it('should enforce type CHECK constraint on backups', () => {
+      const db = initializeDatabase({ dbPath });
+
+      expect(() => {
+        db.prepare(
+          "INSERT INTO backups (id, targets, storage_type, storage_path, status, type) VALUES ('backup-2', 'nginx', 'local', '/data/backups/backup-2.tar', 'completed', 'invalid_type')"
+        ).run();
+      }).toThrow();
+
+      closeDatabase(db);
+    });
+
+    it('should default backups type to volume', () => {
+      const db = initializeDatabase({ dbPath });
+
+      db.prepare(
+        "INSERT INTO backups (id, targets, storage_type, storage_path, status) VALUES ('backup-3', 'nginx', 'local', '/data/backups/backup-3.tar', 'completed')"
+      ).run();
+
+      const backup = db.prepare("SELECT type FROM backups WHERE id = 'backup-3'").get() as { type: string };
+      expect(backup.type).toBe('volume');
+
+      closeDatabase(db);
+    });
+
+    it('should create restore_history table with correct schema', () => {
+      const db = initializeDatabase({ dbPath });
+
+      const tables = listTables(db);
+      expect(tables).toContain('restore_history');
+
+      // Insert a backup first (FK target)
+      db.prepare(
+        "INSERT INTO backups (id, targets, storage_type, storage_path, status) VALUES ('backup-4', 'nginx', 'local', '/data/backups/backup-4.tar', 'completed')"
+      ).run();
+
+      // Insert a restore history record
+      db.prepare(
+        "INSERT INTO restore_history (id, backup_id, target_container, safety_snapshot_id, outcome, started_at) VALUES ('restore-1', 'backup-4', 'my-nginx', 'safety-snap-1', 'success', '2024-01-01T12:00:00Z')"
+      ).run();
+
+      const restore = db.prepare("SELECT * FROM restore_history WHERE id = 'restore-1'").get() as Record<string, unknown>;
+      expect(restore.backup_id).toBe('backup-4');
+      expect(restore.target_container).toBe('my-nginx');
+      expect(restore.safety_snapshot_id).toBe('safety-snap-1');
+      expect(restore.outcome).toBe('success');
+      expect(restore.error_message).toBeNull();
+      expect(restore.started_at).toBe('2024-01-01T12:00:00Z');
+      expect(restore.completed_at).toBeNull();
+
+      closeDatabase(db);
+    });
+
+    it('should enforce outcome CHECK constraint on restore_history', () => {
+      const db = initializeDatabase({ dbPath });
+
+      db.prepare(
+        "INSERT INTO backups (id, targets, storage_type, storage_path, status) VALUES ('backup-5', 'nginx', 'local', '/data/backups/backup-5.tar', 'completed')"
+      ).run();
+
+      expect(() => {
+        db.prepare(
+          "INSERT INTO restore_history (id, backup_id, target_container, outcome) VALUES ('restore-2', 'backup-5', 'my-nginx', 'invalid_outcome')"
+        ).run();
+      }).toThrow();
+
+      closeDatabase(db);
+    });
+
+    it('should enforce foreign key on restore_history.backup_id', () => {
+      const db = initializeDatabase({ dbPath });
+
+      expect(() => {
+        db.prepare(
+          "INSERT INTO restore_history (id, backup_id, target_container, outcome) VALUES ('restore-3', 'nonexistent-backup', 'my-nginx', 'success')"
+        ).run();
+      }).toThrow();
+
+      closeDatabase(db);
+    });
+
+    it('should apply V2 migration incrementally to existing V1 database', () => {
+      // Simulate a database that already has V1 applied
+      const db = initializeDatabase({ dbPath });
+      const version = getCurrentSchemaVersion(db);
+      expect(version).toBe(2);
+
+      // Verify V1 tables still exist
+      const tables = listTables(db);
+      expect(tables).toContain('projects');
+      expect(tables).toContain('alerts');
+      expect(tables).toContain('backups');
+
+      // Verify V2 tables exist
+      expect(tables).toContain('alert_silences');
+      expect(tables).toContain('restore_history');
 
       closeDatabase(db);
     });

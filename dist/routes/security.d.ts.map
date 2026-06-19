@@ -1,1 +1,0 @@
-{"version":3,"file":"security.d.ts","sourceRoot":"","sources":["../../src/routes/security.ts"],"names":[],"mappings":"AAAA;;;;;GAKG;AACH,OAAO,EAAE,MAAM,EAAE,MAAM,SAAS,CAAC;AAEjC,OAAO,KAAK,EAAE,eAAe,EAAE,MAAM,gCAAgC,CAAC;AACtE,OAAO,KAAK,EAAE,WAAW,EAAE,MAAM,4BAA4B,CAAC;AAE9D,wBAAgB,oBAAoB,CAClC,eAAe,EAAE,eAAe,EAChC,WAAW,EAAE,WAAW,GACvB,MAAM,CAoQR"}

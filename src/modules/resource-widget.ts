@@ -28,6 +28,8 @@ export interface ContainerMetrics {
   name: string;
   cpuPercent: number;
   memoryMB: number;
+  memoryUsageMB: number;
+  memoryLimitMB: number;
   warning: boolean;
 }
 
@@ -338,8 +340,8 @@ export function createResourceWidget(
         const memoryCache = stats.memory_stats?.stats?.cache ?? 0;
         const memoryMB = Math.round(((memoryUsage - memoryCache) / (1024 * 1024)) * 100) / 100;
 
-        // Memory limit for warning calculation
-        const memoryLimitMB = (stats.memory_stats?.limit ?? 0) / (1024 * 1024);
+        // Memory limit for warning calculation and resource bars
+        const memoryLimitMB = Math.round(((stats.memory_stats?.limit ?? 0) / (1024 * 1024)) * 100) / 100;
         const memoryUsagePercent = memoryLimitMB > 0 ? (memoryMB / memoryLimitMB) * 100 : 0;
 
         const name = (containerInfo.Names?.[0] ?? '').replace(/^\//, '');
@@ -349,6 +351,8 @@ export function createResourceWidget(
           name,
           cpuPercent,
           memoryMB,
+          memoryUsageMB: memoryMB,
+          memoryLimitMB,
           warning: cpuPercent >= warningThreshold || memoryUsagePercent >= warningThreshold,
         });
       } catch {

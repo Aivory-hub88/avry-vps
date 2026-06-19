@@ -68,21 +68,43 @@ const DEFAULT_CREDENTIALS_PATH = '/app/data/credentials.json';
 /**
  * Load credentials from environment variables or a local config file.
  *
- * Priority 1: PANEL_USERNAME + PANEL_PASSWORD_HASH env vars
- * Priority 2: Config file at credentialsConfigPath or /app/data/credentials.json
+ * Priority 1: PANEL_CREDENTIALS env var (JSON array of {username, passwordHash})
+ * Priority 2: PANEL_USERNAME + PANEL_PASSWORD_HASH env vars (single user)
+ * Priority 3: Config file at credentialsConfigPath or /app/data/credentials.json
  *
  * The password is always expected to be a bcrypt hash.
  */
-export function loadCredentials(configPath?: string): CredentialsConfig | null {
-  // Priority 1: Environment variables
+export function loadCredentials(configPath?: string): CredentialsConfig[] {
+  const results: CredentialsConfig[] = [];
+
+  // Priority 1: Multi-user JSON env var
+  const multiCreds = process.env.PANEL_CREDENTIALS;
+  if (multiCreds) {
+    try {
+      const parsed = JSON.parse(multiCreds) as Array<{ username: string; passwordHash: string }>;
+      if (Array.isArray(parsed)) {
+        for (const entry of parsed) {
+          if (entry.username && entry.passwordHash) {
+            results.push({ username: entry.username, passwordHash: entry.passwordHash });
+          }
+        }
+      }
+    } catch {
+      // Invalid JSON — fall through
+    }
+    if (results.length > 0) return results;
+  }
+
+  // Priority 2: Single-user environment variables
   const envUsername = process.env.PANEL_USERNAME;
   const envPasswordHash = process.env.PANEL_PASSWORD_HASH;
 
   if (envUsername && envPasswordHash) {
-    return { username: envUsername, passwordHash: envPasswordHash };
+    results.push({ username: envUsername, passwordHash: envPasswordHash });
+    return results;
   }
 
-  // Priority 2: Local config file
+  // Priority 3: Local config file (supports single or array format)
   const resolvedPath = configPath
     ? path.resolve(configPath)
     : path.resolve(DEFAULT_CREDENTIALS_PATH);
@@ -90,16 +112,22 @@ export function loadCredentials(configPath?: string): CredentialsConfig | null {
   try {
     if (fs.existsSync(resolvedPath)) {
       const raw = fs.readFileSync(resolvedPath, 'utf-8');
-      const parsed = JSON.parse(raw) as { username?: string; passwordHash?: string };
-      if (parsed.username && parsed.passwordHash) {
-        return { username: parsed.username, passwordHash: parsed.passwordHash };
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        for (const entry of parsed) {
+          if (entry.username && entry.passwordHash) {
+            results.push({ username: entry.username, passwordHash: entry.passwordHash });
+          }
+        }
+      } else if (parsed.username && parsed.passwordHash) {
+        results.push({ username: parsed.username, passwordHash: parsed.passwordHash });
       }
     }
   } catch {
-    // Config file unreadable or invalid — fall through to null
+    // Config file unreadable or invalid — fall through
   }
 
-  return null;
+  return results;
 }
 
 /**
@@ -122,7 +150,24 @@ function rowToSession(row: SessionRow): Session {
  */
 export function createAuthModule(db: Database.Database, config: AuthConfig): AuthModule {
   const timeoutMinutes = config.sessionTimeoutMinutes ?? DEFAULT_SESSION_TIMEOUT_MINUTES;
-  const credentials = loadCredentials(config.credentialsConfigPath);
+  const envCredentials = loadCredentials(config.credentialsConfigPath);
+
+  // Check if admin_users table exists (V3+ schema)
+  const hasAdminUsersTable = (() => {
+    try {
+      const row = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='admin_users'"
+      ).get();
+      return !!row;
+    } catch {
+      return false;
+    }
+  })();
+
+  // Prepared statement for DB-based credential lookup
+  const findAdminUser = hasAdminUsersTable
+    ? db.prepare('SELECT username, password_hash FROM admin_users WHERE username = ? AND active = 1')
+    : null;
 
   // Prepared statements for performance
   const insertSession = db.prepare(
@@ -147,18 +192,30 @@ export function createAuthModule(db: Database.Database, config: AuthConfig): Aut
 
   /**
    * Validate that a username/password pair matches configured credentials.
+   * Priority 1: Check admin_users DB table (V3+ schema)
+   * Priority 2: Check env var credentials (backward compatibility)
    * Uses bcrypt to compare the plaintext password against the stored hash.
    */
   async function validateCredentials(username: string, password: string): Promise<boolean> {
-    if (!credentials) {
+    // Priority 1: DB-backed admin_users table
+    if (findAdminUser) {
+      const row = findAdminUser.get(username) as { username: string; password_hash: string } | undefined;
+      if (row) {
+        return bcrypt.compare(password, row.password_hash);
+      }
+    }
+
+    // Priority 2: Env var credentials (fallback)
+    if (envCredentials.length === 0) {
       return false;
     }
 
-    if (username !== credentials.username) {
+    const matchingCred = envCredentials.find(c => c.username === username);
+    if (!matchingCred) {
       return false;
     }
 
-    return bcrypt.compare(password, credentials.passwordHash);
+    return bcrypt.compare(password, matchingCred.passwordHash);
   }
 
   /**

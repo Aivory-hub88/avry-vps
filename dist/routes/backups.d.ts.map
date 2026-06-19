@@ -1,1 +1,0 @@
-{"version":3,"file":"backups.d.ts","sourceRoot":"","sources":["../../src/routes/backups.ts"],"names":[],"mappings":"AAAA;;;;;GAKG;AACH,OAAO,EAAE,MAAM,EAAE,MAAM,SAAS,CAAC;AAEjC,OAAO,KAAK,EAAE,aAAa,EAAE,MAAM,8BAA8B,CAAC;AAClE,OAAO,KAAK,EAAE,WAAW,EAAE,MAAM,4BAA4B,CAAC;AAE9D,wBAAgB,mBAAmB,CACjC,aAAa,EAAE,aAAa,EAC5B,WAAW,EAAE,WAAW,GACvB,MAAM,CAkJR"}

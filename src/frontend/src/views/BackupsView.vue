@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { useAuthStore } from '@/stores/auth';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 
@@ -11,38 +11,46 @@ interface BackupEntry {
   size: number;
   targets: string[];
   storage: 'local' | 's3';
+  storagePath?: string;
   status: 'completed' | 'failed' | 'in-progress';
 }
 
-interface BackupSchedule {
-  id: string;
-  frequency: string;
-  targets: string[];
-  storageType: 'local' | 's3';
-  storageConfig: Record<string, string>;
-  retentionCount: number;
-  enabled: boolean;
+interface PaginatedResponse {
+  items: BackupEntry[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
 }
 
 const backups = ref<BackupEntry[]>([]);
-const schedule = ref<BackupSchedule | null>(null);
 const loading = ref(false);
 const error = ref<string | null>(null);
 const successMessage = ref<string | null>(null);
 const actionLoading = ref(false);
 
-// Schedule form
-const showScheduleForm = ref(false);
-const formFrequency = ref('0 2 * * *');
-const formTargets = ref<string[]>(['volumes', 'compose-files']);
-const formStorageType = ref<'local' | 's3'>('local');
-const formRetention = ref(7);
-const formS3Bucket = ref('');
-const formS3Region = ref('');
-const formS3Endpoint = ref('');
-const formLocalPath = ref('/backups');
+// Pagination
+const currentPage = ref(1);
+const pageSize = ref(20);
+const totalItems = ref(0);
+const totalPages = ref(0);
 
-// Confirm dialog
+// Snapshot dialog
+const showSnapshotDialog = ref(false);
+const snapshotContainerId = ref('');
+const snapshotCommitMessage = ref('');
+
+// Export dialog
+const showExportDialog = ref(false);
+const exportImageName = ref('');
+const exportBackupId = ref<string | null>(null);
+
+// Restore dialog
+const showRestoreDialog = ref(false);
+const restoreBackupId = ref('');
+const restoreTargetContainer = ref('');
+
+// Confirm delete dialog
 const confirmOpen = ref(false);
 const confirmTitle = ref('');
 const confirmMessage = ref('');
@@ -61,13 +69,33 @@ function formatSize(bytes: number): string {
   return `${(bytes / 1073741824).toFixed(2)} GB`;
 }
 
+function formatTimestamp(ts: string): string {
+  return new Date(ts).toLocaleString();
+}
+
+function statusClass(status: string): string {
+  if (status === 'completed') return 'status-completed';
+  if (status === 'failed') return 'status-failed';
+  return 'status-progress';
+}
+
+const hasPrevPage = computed(() => currentPage.value > 1);
+const hasNextPage = computed(() => currentPage.value < totalPages.value);
+
 async function fetchBackups(): Promise<void> {
   loading.value = true;
   error.value = null;
   try {
-    const res = await fetch('/api/backups', { headers: headers() });
+    const res = await fetch(
+      `/api/backups?page=${currentPage.value}&pageSize=${pageSize.value}`,
+      { headers: headers() }
+    );
     if (!res.ok) throw new Error('Failed to fetch backups');
-    backups.value = await res.json();
+    const data: PaginatedResponse = await res.json();
+    backups.value = data.items;
+    totalItems.value = data.total;
+    totalPages.value = data.totalPages;
+    currentPage.value = data.page;
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Unknown error';
   } finally {
@@ -75,89 +103,41 @@ async function fetchBackups(): Promise<void> {
   }
 }
 
-async function fetchSchedule(): Promise<void> {
-  try {
-    const res = await fetch('/api/backups/schedule', { headers: headers() });
-    if (!res.ok) return;
-    const data = await res.json();
-    if (data && data.id) {
-      schedule.value = data;
-    }
-  } catch {
-    // Schedule may not exist yet
-  }
+function goToPage(page: number): void {
+  if (page < 1 || page > totalPages.value) return;
+  currentPage.value = page;
+  fetchBackups();
 }
 
-function openScheduleForm(): void {
-  if (schedule.value) {
-    formFrequency.value = schedule.value.frequency;
-    formTargets.value = [...schedule.value.targets];
-    formStorageType.value = schedule.value.storageType;
-    formRetention.value = schedule.value.retentionCount;
-    if (schedule.value.storageConfig) {
-      formS3Bucket.value = schedule.value.storageConfig.bucket || '';
-      formS3Region.value = schedule.value.storageConfig.region || '';
-      formS3Endpoint.value = schedule.value.storageConfig.endpoint || '';
-      formLocalPath.value = schedule.value.storageConfig.path || '/backups';
-    }
-  }
-  showScheduleForm.value = true;
+// Snapshot
+function openSnapshotDialog(): void {
+  snapshotContainerId.value = '';
+  snapshotCommitMessage.value = '';
+  showSnapshotDialog.value = true;
 }
 
-async function saveSchedule(): Promise<void> {
-  error.value = null;
-  actionLoading.value = true;
-
-  const storageConfig: Record<string, string> = {};
-  if (formStorageType.value === 's3') {
-    storageConfig.bucket = formS3Bucket.value;
-    storageConfig.region = formS3Region.value;
-    if (formS3Endpoint.value) storageConfig.endpoint = formS3Endpoint.value;
-  } else {
-    storageConfig.path = formLocalPath.value;
-  }
-
-  const payload = {
-    frequency: formFrequency.value,
-    targets: formTargets.value,
-    storageType: formStorageType.value,
-    storageConfig,
-    retentionCount: formRetention.value,
-    enabled: true,
-  };
-
-  try {
-    const res = await fetch('/api/backups/schedule', {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) throw new Error('Failed to save backup schedule');
-    successMessage.value = 'Backup schedule saved successfully.';
-    showScheduleForm.value = false;
-    await fetchSchedule();
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : 'Unknown error';
-  } finally {
-    actionLoading.value = false;
-  }
-}
-
-async function triggerManualBackup(): Promise<void> {
+async function triggerSnapshot(): Promise<void> {
+  if (!snapshotContainerId.value.trim()) return;
   actionLoading.value = true;
   error.value = null;
   successMessage.value = null;
 
   try {
-    const res = await fetch('/api/backups/trigger', {
+    const res = await fetch('/api/backups/snapshot', {
       method: 'POST',
       headers: headers(),
+      body: JSON.stringify({
+        container_id: snapshotContainerId.value.trim(),
+        commit_message: snapshotCommitMessage.value.trim() || undefined,
+      }),
     });
-    if (!res.ok) throw new Error('Failed to trigger backup');
-    const data = await res.json();
-    successMessage.value = `Manual backup started. Job ID: ${data.jobId}`;
-    // Refresh backup list after a short delay
-    setTimeout(() => fetchBackups(), 2000);
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || 'Failed to create snapshot');
+    }
+    successMessage.value = 'Snapshot created successfully.';
+    showSnapshotDialog.value = false;
+    await fetchBackups();
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Unknown error';
   } finally {
@@ -165,19 +145,93 @@ async function triggerManualBackup(): Promise<void> {
   }
 }
 
-function requestRestore(backup: BackupEntry): void {
-  confirmTitle.value = 'Restore Backup';
-  confirmMessage.value = `Are you sure you want to restore from the backup created on ${new Date(backup.timestamp).toLocaleString()}? This will overwrite current data for targets: ${backup.targets.join(', ')}.`;
+// Export
+function openExportDialog(backup?: BackupEntry): void {
+  exportImageName.value = '';
+  exportBackupId.value = backup?.id ?? null;
+  showExportDialog.value = true;
+}
+
+async function triggerExport(): Promise<void> {
+  if (!exportImageName.value.trim()) return;
+  actionLoading.value = true;
+  error.value = null;
+  successMessage.value = null;
+
+  try {
+    const res = await fetch('/api/backups/export', {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({
+        image_name: exportImageName.value.trim(),
+      }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || 'Failed to export image');
+    }
+    successMessage.value = 'Image exported successfully.';
+    showExportDialog.value = false;
+    await fetchBackups();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Unknown error';
+  } finally {
+    actionLoading.value = false;
+  }
+}
+
+// Restore
+function openRestoreDialog(backup: BackupEntry): void {
+  restoreBackupId.value = backup.id;
+  restoreTargetContainer.value = '';
+  showRestoreDialog.value = true;
+}
+
+async function triggerRestore(): Promise<void> {
+  if (!restoreTargetContainer.value.trim()) return;
+
+  // Show confirmation before proceeding
+  showRestoreDialog.value = false;
+  confirmTitle.value = 'Confirm Restore';
+  confirmMessage.value = `Are you sure you want to restore backup to container "${restoreTargetContainer.value.trim()}"? A safety snapshot will be created before the restore, but this operation will replace the current container state.`;
   confirmLabel.value = 'Restore';
   confirmDanger.value = true;
   pendingAction = async () => {
-    const res = await fetch(`/api/backups/${backup.id}/restore`, {
+    const res = await fetch('/api/backups/restore', {
       method: 'POST',
       headers: headers(),
+      body: JSON.stringify({
+        backup_id: restoreBackupId.value,
+        target_container: restoreTargetContainer.value.trim(),
+      }),
     });
-    if (!res.ok) throw new Error('Failed to start restore');
-    const data = await res.json();
-    successMessage.value = `Restore started. Job ID: ${data.jobId}`;
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || 'Failed to restore backup');
+    }
+    successMessage.value = 'Restore completed successfully.';
+    await fetchBackups();
+  };
+  confirmOpen.value = true;
+}
+
+// Delete
+function requestDelete(backup: BackupEntry): void {
+  confirmTitle.value = 'Delete Backup';
+  confirmMessage.value = `Are you sure you want to delete the backup from ${formatTimestamp(backup.timestamp)}? This will remove the archive from local and S3 storage. This action cannot be undone.`;
+  confirmLabel.value = 'Delete';
+  confirmDanger.value = true;
+  pendingAction = async () => {
+    const res = await fetch(`/api/backups/${backup.id}`, {
+      method: 'DELETE',
+      headers: headers(),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || 'Failed to delete backup');
+    }
+    successMessage.value = 'Backup deleted successfully.';
+    await fetchBackups();
   };
   confirmOpen.value = true;
 }
@@ -200,208 +254,228 @@ async function handleConfirm(): Promise<void> {
   }
 }
 
-function toggleTarget(target: string): void {
-  const idx = formTargets.value.indexOf(target);
-  if (idx >= 0) {
-    formTargets.value.splice(idx, 1);
-  } else {
-    formTargets.value.push(target);
-  }
-}
-
-function statusClass(status: string): string {
-  if (status === 'completed') return 'status-completed';
-  if (status === 'failed') return 'status-failed';
-  return 'status-progress';
-}
-
 onMounted(() => {
   fetchBackups();
-  fetchSchedule();
 });
 </script>
 
 <template>
   <div class="backups-view">
     <div class="view-header">
-      <h2>Backups</h2>
+      <h2>Backup Registry</h2>
       <div class="header-actions">
-        <button class="btn btn-secondary" @click="openScheduleForm">Configure Schedule</button>
-        <button class="btn btn-primary" :disabled="actionLoading" @click="triggerManualBackup">
-          {{ actionLoading ? 'Starting...' : 'Backup Now' }}
+        <button class="btn btn-primary" :disabled="actionLoading" @click="openSnapshotDialog">
+          Create Snapshot
         </button>
       </div>
     </div>
 
     <!-- Success message -->
-    <div v-if="successMessage" class="success-banner">
+    <div v-if="successMessage" class="success-banner" role="status">
       <span>{{ successMessage }}</span>
-      <button class="dismiss-btn" @click="successMessage = null">×</button>
+      <button class="dismiss-btn" aria-label="Dismiss" @click="successMessage = null">×</button>
     </div>
 
     <!-- Error -->
-    <div v-if="error" class="error-banner">
+    <div v-if="error" class="error-banner" role="alert">
       <span>{{ error }}</span>
-      <button class="dismiss-btn" @click="error = null">×</button>
-    </div>
-
-    <!-- Current schedule summary -->
-    <div v-if="schedule" class="schedule-summary">
-      <h3>Active Schedule</h3>
-      <div class="summary-grid">
-        <div class="summary-item">
-          <span class="summary-label">Frequency</span>
-          <span class="summary-value monospace">{{ schedule.frequency }}</span>
-        </div>
-        <div class="summary-item">
-          <span class="summary-label">Targets</span>
-          <span class="summary-value">{{ schedule.targets.join(', ') }}</span>
-        </div>
-        <div class="summary-item">
-          <span class="summary-label">Storage</span>
-          <span class="summary-value">{{ schedule.storageType === 's3' ? 'S3' : 'Local' }}</span>
-        </div>
-        <div class="summary-item">
-          <span class="summary-label">Retention</span>
-          <span class="summary-value">{{ schedule.retentionCount }} backups</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- Schedule Form -->
-    <div v-if="showScheduleForm" class="form-card">
-      <h3>Backup Schedule Configuration</h3>
-      <form @submit.prevent="saveSchedule">
-        <div class="form-group">
-          <label for="backup-frequency">Frequency (cron expression)</label>
-          <input
-            id="backup-frequency"
-            v-model="formFrequency"
-            type="text"
-            placeholder="0 2 * * *"
-            required
-          />
-          <p class="form-hint">e.g. "0 2 * * *" = daily at 2:00 AM</p>
-        </div>
-
-        <div class="form-group">
-          <label>Backup Targets</label>
-          <div class="checkbox-list">
-            <label class="checkbox-item">
-              <input type="checkbox" :checked="formTargets.includes('volumes')" @change="toggleTarget('volumes')" />
-              Docker Volumes
-            </label>
-            <label class="checkbox-item">
-              <input type="checkbox" :checked="formTargets.includes('compose-files')" @change="toggleTarget('compose-files')" />
-              Compose Files
-            </label>
-            <label class="checkbox-item">
-              <input type="checkbox" :checked="formTargets.includes('databases')" @change="toggleTarget('databases')" />
-              Databases
-            </label>
-            <label class="checkbox-item">
-              <input type="checkbox" :checked="formTargets.includes('configs')" @change="toggleTarget('configs')" />
-              Configuration Files
-            </label>
-          </div>
-        </div>
-
-        <div class="form-group">
-          <label for="storage-type">Storage Type</label>
-          <select id="storage-type" v-model="formStorageType">
-            <option value="local">Local Filesystem</option>
-            <option value="s3">S3-Compatible Storage</option>
-          </select>
-        </div>
-
-        <template v-if="formStorageType === 'local'">
-          <div class="form-group">
-            <label for="local-path">Local Path</label>
-            <input id="local-path" v-model="formLocalPath" type="text" placeholder="/backups" required />
-          </div>
-        </template>
-
-        <template v-if="formStorageType === 's3'">
-          <div class="form-row">
-            <div class="form-group">
-              <label for="s3-bucket">Bucket</label>
-              <input id="s3-bucket" v-model="formS3Bucket" type="text" placeholder="my-backups" required />
-            </div>
-            <div class="form-group">
-              <label for="s3-region">Region</label>
-              <input id="s3-region" v-model="formS3Region" type="text" placeholder="us-east-1" required />
-            </div>
-          </div>
-          <div class="form-group">
-            <label for="s3-endpoint">Endpoint (optional, for MinIO etc.)</label>
-            <input id="s3-endpoint" v-model="formS3Endpoint" type="text" placeholder="https://s3.example.com" />
-          </div>
-        </template>
-
-        <div class="form-group">
-          <label for="retention-count">Retention (number of backups to keep)</label>
-          <input id="retention-count" v-model.number="formRetention" type="number" min="1" max="100" required />
-        </div>
-
-        <div class="form-actions">
-          <button type="button" class="btn btn-secondary" @click="showScheduleForm = false">Cancel</button>
-          <button type="submit" class="btn btn-primary" :disabled="actionLoading">
-            {{ actionLoading ? 'Saving...' : 'Save Schedule' }}
-          </button>
-        </div>
-      </form>
+      <button class="dismiss-btn" aria-label="Dismiss" @click="error = null">×</button>
     </div>
 
     <!-- Loading -->
-    <p v-if="loading && backups.length === 0" class="muted">Loading backups...</p>
+    <div v-if="loading && backups.length === 0" class="loading-skeleton">
+      <div class="skeleton-row" v-for="i in 5" :key="i"></div>
+    </div>
 
     <!-- Empty state -->
     <div v-else-if="backups.length === 0 && !loading" class="empty-state">
       <p>No backups found.</p>
-      <p class="muted">Configure a schedule or trigger a manual backup to get started.</p>
+      <p class="muted">Create a snapshot to get started.</p>
     </div>
 
-    <!-- Backup history table -->
+    <!-- Backup registry table -->
     <div v-else class="table-wrapper">
-      <h3 class="section-title">Backup History</h3>
       <table class="data-table">
         <thead>
           <tr>
             <th>Timestamp</th>
             <th>Size</th>
-            <th>Targets</th>
-            <th>Storage</th>
+            <th>Target</th>
+            <th>Storage Location</th>
             <th>Status</th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="backup in backups" :key="backup.id">
-            <td>{{ new Date(backup.timestamp).toLocaleString() }}</td>
+            <td class="col-timestamp">{{ formatTimestamp(backup.timestamp) }}</td>
             <td>{{ formatSize(backup.size) }}</td>
             <td>{{ backup.targets.join(', ') }}</td>
             <td>
               <span class="storage-badge">{{ backup.storage === 's3' ? 'S3' : 'Local' }}</span>
+              <span v-if="backup.storagePath" class="storage-path">{{ backup.storagePath }}</span>
             </td>
             <td>
               <span :class="['status-badge', statusClass(backup.status)]">
                 {{ backup.status }}
               </span>
             </td>
-            <td>
+            <td class="actions-cell">
               <button
                 v-if="backup.status === 'completed'"
                 class="btn btn-sm btn-secondary"
-                @click="requestRestore(backup)"
+                title="Export image as tar archive"
+                @click="openExportDialog(backup)"
+              >
+                Export
+              </button>
+              <button
+                v-if="backup.status === 'completed'"
+                class="btn btn-sm btn-secondary"
+                title="Restore container from this snapshot"
+                @click="openRestoreDialog(backup)"
               >
                 Restore
+              </button>
+              <button
+                class="btn btn-sm btn-danger-outline"
+                title="Delete backup"
+                @click="requestDelete(backup)"
+              >
+                Delete
               </button>
             </td>
           </tr>
         </tbody>
       </table>
+
+      <!-- Pagination -->
+      <div v-if="totalPages > 1" class="pagination">
+        <button
+          class="btn btn-sm btn-secondary"
+          :disabled="!hasPrevPage"
+          @click="goToPage(currentPage - 1)"
+        >
+          ← Prev
+        </button>
+        <span class="page-info">
+          Page {{ currentPage }} of {{ totalPages }}
+          <span class="total-info">({{ totalItems }} total)</span>
+        </span>
+        <button
+          class="btn btn-sm btn-secondary"
+          :disabled="!hasNextPage"
+          @click="goToPage(currentPage + 1)"
+        >
+          Next →
+        </button>
+      </div>
     </div>
 
+    <!-- Snapshot Dialog -->
+    <Teleport to="body">
+      <div v-if="showSnapshotDialog" class="dialog-overlay" @click.self="showSnapshotDialog = false">
+        <div class="dialog" role="dialog" aria-modal="true" aria-label="Create Snapshot">
+          <h3 class="dialog-title">Create Container Snapshot</h3>
+          <p class="dialog-description">
+            Create a Docker image snapshot of a running container.
+          </p>
+          <form @submit.prevent="triggerSnapshot">
+            <div class="form-group">
+              <label for="snapshot-container-id">Container ID or Name</label>
+              <input
+                id="snapshot-container-id"
+                v-model="snapshotContainerId"
+                type="text"
+                placeholder="e.g. my-app-container"
+                required
+                class="form-input"
+              />
+            </div>
+            <div class="form-group">
+              <label for="snapshot-commit-message">Commit Message (optional)</label>
+              <input
+                id="snapshot-commit-message"
+                v-model="snapshotCommitMessage"
+                type="text"
+                placeholder="e.g. Pre-deployment backup"
+                class="form-input"
+              />
+            </div>
+            <div class="dialog-actions">
+              <button type="button" class="btn btn-secondary" @click="showSnapshotDialog = false">Cancel</button>
+              <button type="submit" class="btn btn-primary" :disabled="actionLoading || !snapshotContainerId.trim()">
+                {{ actionLoading ? 'Creating...' : 'Create Snapshot' }}
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Export Dialog -->
+    <Teleport to="body">
+      <div v-if="showExportDialog" class="dialog-overlay" @click.self="showExportDialog = false">
+        <div class="dialog" role="dialog" aria-modal="true" aria-label="Export Image">
+          <h3 class="dialog-title">Export Image</h3>
+          <p class="dialog-description">
+            Export a Docker image as a tar archive to the configured backup storage location.
+          </p>
+          <form @submit.prevent="triggerExport">
+            <div class="form-group">
+              <label for="export-image-name">Image Name</label>
+              <input
+                id="export-image-name"
+                v-model="exportImageName"
+                type="text"
+                placeholder="e.g. my-app-snapshot-20240101-120000"
+                required
+                class="form-input"
+              />
+            </div>
+            <div class="dialog-actions">
+              <button type="button" class="btn btn-secondary" @click="showExportDialog = false">Cancel</button>
+              <button type="submit" class="btn btn-primary" :disabled="actionLoading || !exportImageName.trim()">
+                {{ actionLoading ? 'Exporting...' : 'Export' }}
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Restore Dialog -->
+    <Teleport to="body">
+      <div v-if="showRestoreDialog" class="dialog-overlay" @click.self="showRestoreDialog = false">
+        <div class="dialog" role="dialog" aria-modal="true" aria-label="Restore Backup">
+          <h3 class="dialog-title">Restore from Backup</h3>
+          <p class="dialog-description">
+            Restore a container from this snapshot. A safety snapshot of the current state will be created automatically before the restore.
+          </p>
+          <form @submit.prevent="triggerRestore">
+            <div class="form-group">
+              <label for="restore-target">Target Container Name</label>
+              <input
+                id="restore-target"
+                v-model="restoreTargetContainer"
+                type="text"
+                placeholder="e.g. my-app-container"
+                required
+                class="form-input"
+              />
+            </div>
+            <div class="dialog-actions">
+              <button type="button" class="btn btn-secondary" @click="showRestoreDialog = false">Cancel</button>
+              <button type="submit" class="btn btn-primary" :disabled="actionLoading || !restoreTargetContainer.trim()">
+                Continue
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Confirm Dialog for destructive actions -->
     <ConfirmDialog
       :open="confirmOpen"
       :title="confirmTitle"
@@ -469,138 +543,27 @@ onMounted(() => {
   padding: 0 0.25rem;
 }
 
-/* Schedule summary */
-.schedule-summary {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: 0.5rem;
-  padding: 1.25rem;
-  margin-bottom: 1.5rem;
-}
-
-.schedule-summary h3 {
-  font-size: 0.875rem;
-  font-weight: 600;
-  margin-bottom: 0.75rem;
-}
-
-.summary-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-  gap: 0.75rem;
-}
-
-.summary-item {
+/* Loading skeleton */
+.loading-skeleton {
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
+  gap: 0.5rem;
 }
 
-.summary-label {
-  font-size: 0.6875rem;
-  text-transform: uppercase;
-  letter-spacing: 0.025em;
-  color: var(--color-text-muted);
-}
-
-.summary-value {
-  font-size: 0.8125rem;
-  font-weight: 500;
-}
-
-.monospace {
-  font-family: 'Courier New', Courier, monospace;
-}
-
-/* Form */
-.form-card {
+.skeleton-row {
+  height: 2.5rem;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
-  border-radius: 0.5rem;
-  padding: 1.25rem;
-  margin-bottom: 1.5rem;
-}
-
-.form-card h3 {
-  font-size: 0.9375rem;
-  font-weight: 600;
-  margin-bottom: 1rem;
-}
-
-.form-group {
-  margin-bottom: 0.875rem;
-}
-
-.form-group label {
-  display: block;
-  font-size: 0.8125rem;
-  font-weight: 500;
-  margin-bottom: 0.375rem;
-  color: var(--color-text-muted);
-}
-
-.form-group input[type="text"],
-.form-group input[type="number"],
-.form-group select {
-  width: 100%;
-  padding: 0.5rem 0.75rem;
-  background: var(--color-bg);
-  border: 1px solid var(--color-border);
   border-radius: 0.375rem;
-  font-size: 0.875rem;
-  color: var(--color-text);
+  animation: pulse 1.5s ease-in-out infinite;
 }
 
-.form-group input:focus,
-.form-group select:focus {
-  outline: none;
-  border-color: var(--color-primary);
-}
-
-.form-hint {
-  font-size: 0.75rem;
-  color: var(--color-text-muted);
-  margin-top: 0.375rem;
-}
-
-.form-row {
-  display: flex;
-  gap: 1rem;
-}
-
-.form-row .form-group {
-  flex: 1;
-}
-
-.checkbox-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-}
-
-.checkbox-item {
-  display: flex;
-  align-items: center;
-  gap: 0.375rem;
-  font-size: 0.8125rem;
-  cursor: pointer;
-  color: var(--color-text);
-}
-
-.form-actions {
-  display: flex;
-  gap: 0.75rem;
-  justify-content: flex-end;
-  margin-top: 1rem;
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
 
 /* Table */
-.section-title {
-  font-size: 0.875rem;
-  font-weight: 600;
-  margin-bottom: 0.75rem;
-}
-
 .table-wrapper {
   overflow-x: auto;
 }
@@ -635,6 +598,23 @@ onMounted(() => {
   border-bottom: none;
 }
 
+.data-table tbody tr:hover {
+  background: var(--color-surface-hover);
+}
+
+.col-timestamp {
+  font-family: monospace;
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+.actions-cell {
+  white-space: nowrap;
+  display: flex;
+  gap: 0.375rem;
+  align-items: center;
+}
+
 /* Badges */
 .storage-badge {
   display: inline-block;
@@ -644,6 +624,18 @@ onMounted(() => {
   font-weight: 500;
   background: rgba(99, 102, 241, 0.15);
   color: var(--color-primary);
+}
+
+.storage-path {
+  display: block;
+  font-size: 0.6875rem;
+  color: var(--color-text-muted);
+  margin-top: 0.25rem;
+  font-family: monospace;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .status-badge {
@@ -668,6 +660,27 @@ onMounted(() => {
 .status-progress {
   background: rgba(234, 179, 8, 0.15);
   color: #a16207;
+}
+
+/* Pagination */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin-top: 1rem;
+  padding: 0.75rem 0;
+}
+
+.page-info {
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+}
+
+.total-info {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  opacity: 0.7;
 }
 
 /* Buttons */
@@ -709,6 +722,85 @@ onMounted(() => {
   background: var(--color-border);
 }
 
+.btn-danger-outline {
+  background: transparent;
+  border: 1px solid var(--color-danger);
+  color: var(--color-danger);
+}
+
+.btn-danger-outline:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.1);
+}
+
+/* Dialog */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.dialog {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 0.5rem;
+  padding: 1.5rem;
+  width: 100%;
+  max-width: 460px;
+}
+
+.dialog-title {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 0.375rem;
+}
+
+.dialog-description {
+  color: var(--color-text-muted);
+  font-size: 0.8125rem;
+  margin-bottom: 1.25rem;
+  line-height: 1.5;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  margin-top: 1.25rem;
+}
+
+/* Forms in dialogs */
+.form-group {
+  margin-bottom: 0.875rem;
+}
+
+.form-group label {
+  display: block;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  margin-bottom: 0.375rem;
+  color: var(--color-text-muted);
+}
+
+.form-input {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 0.375rem;
+  font-size: 0.875rem;
+  color: var(--color-text);
+}
+
+.form-input:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+/* Misc */
 .muted {
   color: var(--color-text-muted);
   font-size: 0.875rem;

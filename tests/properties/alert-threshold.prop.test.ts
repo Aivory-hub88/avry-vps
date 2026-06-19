@@ -51,7 +51,11 @@ function createTestDb(): Database.Database {
       affected_resource TEXT NOT NULL,
       severity TEXT NOT NULL,
       delivery_status TEXT,
-      message TEXT
+      message TEXT,
+      acknowledged_at TEXT,
+      acknowledged_by TEXT,
+      resolved_at TEXT,
+      resolution_status TEXT DEFAULT 'active'
     );
 
     CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp DESC);

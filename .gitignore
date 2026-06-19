@@ -4,6 +4,12 @@ node_modules/
 # env files
 .env
 
+# build output
+dist/
+
+# database files
+data/
+
 # playwright
 playwright-report/
 test-results/

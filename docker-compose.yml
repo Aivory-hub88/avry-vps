@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     image: aivory-vps-panel:latest
-    container_name: aivory-vps-panel
+    container_name: vps-panel
     restart: unless-stopped
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
@@ -27,6 +27,8 @@ services:
       - DOCKER_HOST=/var/run/docker.sock
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - DB_PATH=/app/data/panel.db
+      - DATABASE_URL=${DATABASE_URL}
+      - VPS_PANEL_API_TOKEN=${VPS_PANEL_API_TOKEN:?VPS_PANEL_API_TOKEN is required}
       - CORS_ORIGINS=${CORS_ORIGINS:-*}
       - PANEL_USERNAME=${ADMIN_USERNAME:-admin}
       - PANEL_PASSWORD_HASH=${ADMIN_PASSWORD:-}
@@ -42,7 +44,7 @@ services:
       - BACKUP_S3_ACCESS_KEY=${BACKUP_S3_ACCESS_KEY:-}
       - BACKUP_S3_SECRET_KEY=${BACKUP_S3_SECRET_KEY:-}
     networks:
-      - aivery-network
+      - aivory-network
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${PORT:-3000}/health"]
       interval: 30s
@@ -62,5 +64,5 @@ volumes:
     driver: local
 
 networks:
-  aivery-network:
+  aivory-network:
     external: true

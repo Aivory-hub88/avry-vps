@@ -14,6 +14,8 @@ import { accessSync, constants, existsSync } from 'node:fs';
 import path from 'node:path';
 
 import { initializeDatabase, checkHealth, closeDatabase, getDbPath } from './database/index.js';
+import { createPgClient, type PgClient } from './database/pg-client.js';
+import { runPgMigrations } from './database/migrations.js';
 import { createAuthModule } from './modules/auth.js';
 import { createRateLimiter, type RateLimiter } from './modules/rate-limiter.js';
 import { createContainerManager } from './modules/container-manager.js';
@@ -37,7 +39,23 @@ import { createCICDBridge } from './modules/cicd-bridge.js';
 import { createSecurityManager } from './modules/security-manager.js';
 
 import { registerRoutes } from './routes/index.js';
+import { createMonitoringRouter } from './routes/monitoring.js';
 import { setupSocketHandlers, createAlertNotificationCallback } from './socket/index.js';
+
+import { createMetricsCollector } from './services/metrics-collector.js';
+import { createProjectRegistry } from './services/project-registry.js';
+import { createHistoricalMetricsService } from './services/historical-metrics.js';
+import { createUserResourceTracker } from './services/user-resource-tracking.js';
+import { createSettingsService, type SettingsService } from './services/settings-service.js';
+import { createDownsamplingEngine, type DownsamplingEngine } from './services/downsampling-engine.js';
+import {
+  createSettingsHotReload,
+  createMetricsCollectionHandle,
+  createAlertThresholdHandle,
+  createBackupScheduleHandle,
+  type HotReloadSubscription,
+} from './services/settings-hot-reload.js';
+import { createPartitionManager, type PartitionManagerInstance } from './database/partition-manager.js';
 
 import { validateEnv, type EnvConfig } from './config/env.js';
 
@@ -51,8 +69,11 @@ export interface AppInstance {
   httpServer: ReturnType<typeof createServer>;
   config: EnvConfig;
   db: Database.Database;
+  pgClient: PgClient | null;
   modules: ModuleInstances;
   degradation: DegradationStatus;
+  /** Initialize PostgreSQL connection and run schema migrations */
+  initializePostgres(): Promise<void>;
   startBackgroundServices(): void;
   shutdown(): void;
 }
@@ -280,6 +301,20 @@ function createDomainDbAdapter(db: Database.Database) {
 export function createApp(envConfig?: EnvConfig): AppInstance {
   const config = envConfig ?? validateEnv();
 
+  // ─── Startup Validation (Requirements 5.6, 11.10) ─────────────────────────
+  // Only enforce in production/non-test environments; tests provide their own config
+  if (!process.env.VITEST && !envConfig) {
+    if (!process.env.VPS_PANEL_API_TOKEN) {
+      console.error('[VPS Panel] FATAL: VPS_PANEL_API_TOKEN environment variable is not set. The monitoring API requires an authentication token to operate securely.');
+      process.exit(1);
+    }
+
+    if (!process.env.DATABASE_URL) {
+      console.error('[VPS Panel] FATAL: DATABASE_URL environment variable is not set. PostgreSQL is required for monitoring features.');
+      process.exit(1);
+    }
+  }
+
   // ─── Degradation Status ────────────────────────────────────────────────────
   const degradation: DegradationStatus = {
     dockerAvailable: isDockerSocketReachable(config.DOCKER_HOST),
@@ -317,6 +352,157 @@ export function createApp(envConfig?: EnvConfig): AppInstance {
   // ─── 1. Database ─────────────────────────────────────────────────────────────
   const db = initializeDatabase();
   const dbPath = getDbPath();
+
+  // ─── 1b. PostgreSQL Client (for monitoring schemas) ──────────────────────────
+  let pgClient: PgClient | null = null;
+  let settingsService: SettingsService | null = null;
+  let downsamplingEngine: DownsamplingEngine | null = null;
+  let partitionManager: PartitionManagerInstance | null = null;
+  let hotReloadSubscription: HotReloadSubscription | null = null;
+
+  // ─── Monitoring Background Job Handles ───────────────────────────────────────
+  let purgeJobInterval: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * Initialize the PostgreSQL connection and run schema migrations.
+   * Called during startup — if DATABASE_URL is set, connects to avry-postgres
+   * and creates vps_panel/monitoring schemas if they don't exist.
+   */
+  async function initializePostgres(): Promise<void> {
+    if (!process.env.DATABASE_URL) {
+      console.warn('[VPS Panel] DATABASE_URL not set — PostgreSQL features disabled');
+      return;
+    }
+
+    try {
+      pgClient = createPgClient();
+      await pgClient.connect();
+      console.log('[VPS Panel] PostgreSQL connected');
+
+      // Run schema migrations (idempotent)
+      await runPgMigrations(pgClient);
+      console.log('[VPS Panel] PostgreSQL migrations complete');
+
+      // ─── Initialize Partition Manager ─────────────────────────────────────────
+      partitionManager = createPartitionManager(pgClient, {
+        onAlert: (event) => {
+          alertSystem.emitAlert(event);
+        },
+      });
+      const partitionStatus = await partitionManager.verifyAndRepair();
+      console.log(`[VPS Panel] Partition Manager: healthy=${partitionStatus.healthy}, created=${partitionStatus.createdPartitions.length} partitions`);
+
+      // ─── Initialize Settings Service ──────────────────────────────────────────
+      settingsService = createSettingsService(pgClient);
+      console.log('[VPS Panel] Settings service initialized');
+
+      // ─── Initialize Downsampling Engine ───────────────────────────────────────
+      downsamplingEngine = createDownsamplingEngine(pgClient, settingsService);
+      downsamplingEngine.start();
+      console.log('[VPS Panel] Downsampling engine started');
+
+      // ─── Initialize Monitoring Services ──────────────────────────────────────
+      const projectRegistry = createProjectRegistry(pgClient);
+      const metricsCollector = createMetricsCollector(
+        { dockerHost: config.DOCKER_HOST },
+        projectRegistry
+      );
+      const historicalMetrics = createHistoricalMetricsService(pgClient);
+      const userResourceTracker = createUserResourceTracker(pgClient);
+
+      // ─── Create & Mount Monitoring Router ────────────────────────────────────
+      const monitoringRouter = createMonitoringRouter({
+        metricsCollector,
+        projectRegistry,
+        historicalMetrics,
+        userResourceTracker,
+        authOptions: {
+          apiTokenEnvVar: 'VPS_PANEL_API_TOKEN',
+          sessionValidator: (token: string) => modules.authModule.validateSession(token),
+        },
+      });
+
+      app.use('/api/monitoring', monitoringRouter);
+      console.log('[VPS Panel] Monitoring routes mounted at /api/monitoring');
+
+      // ─── Start Historical Metrics Collection (every 30s) ─────────────────────
+      // Requirement 7.1: collect and store system-wide metrics at configurable interval
+      const collectionIntervalMs = Number(process.env.METRICS_COLLECTION_INTERVAL_MS) || 30_000;
+
+      // Create hot-reloadable metrics collection handle
+      const metricsCollectionHandle = createMetricsCollectionHandle(
+        collectionIntervalMs,
+        async () => {
+          try {
+            const systemMetrics = await metricsCollector.getSystemMetrics();
+            await historicalMetrics.store(systemMetrics);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[VPS Panel] Metrics collection error: ${msg}`);
+          }
+        }
+      );
+      console.log(`[VPS Panel] Metrics collection started (every ${collectionIntervalMs / 1000}s)`);
+
+      // ─── Start Purge Job for Retention ───────────────────────────────────────
+      const purgeIntervalMs = Number(process.env.METRICS_PURGE_INTERVAL_MS) || 6 * 60 * 60 * 1000; // 6 hours default
+      purgeJobInterval = setInterval(async () => {
+        try {
+          const purgedCount = await historicalMetrics.purgeOldRecords();
+          if (purgedCount > 0) {
+            console.log(`[VPS Panel] Purged ${purgedCount} old metrics records`);
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[VPS Panel] Metrics purge error: ${msg}`);
+        }
+      }, purgeIntervalMs);
+      console.log(`[VPS Panel] Metrics purge job started (every ${purgeIntervalMs / 1000 / 3600}h)`);
+
+      // ─── Settings Hot-Reload Wiring ──────────────────────────────────────────
+      // Connect settings change events to Metrics Collector, Alert System, Backup Manager
+      const alertThresholds = createAlertThresholdHandle({
+        alert_cpu_warning: 80,
+        alert_cpu_critical: 95,
+        alert_memory_warning: 80,
+        alert_memory_critical: 95,
+        alert_disk_warning: 90,
+        alert_disk_critical: 95,
+        alert_consecutive_checks: 3,
+      });
+
+      const backupScheduleHandle = createBackupScheduleHandle(
+        {
+          cronExpression: '0 2 * * *',
+          targets: [],
+          retentionCount: 7,
+          enabled: false,
+        },
+        (newConfig) => {
+          // When schedule settings change, update the backup manager
+          backupManager.updateScheduleFromSettings(newConfig);
+        }
+      );
+
+      hotReloadSubscription = createSettingsHotReload({
+        settingsService,
+        metricsCollection: metricsCollectionHandle,
+        alertThresholds,
+        backupSchedule: backupScheduleHandle,
+      });
+      console.log('[VPS Panel] Settings hot-reload wired');
+
+      // Also ensure partitions exist for future weeks
+      await historicalMetrics.ensurePartitions();
+      console.log('[VPS Panel] Monitoring partitions ensured');
+
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error(`[VPS Panel] PostgreSQL initialization failed: ${msg}`);
+      pgClient = null;
+      throw error;
+    }
+  }
 
   // ─── 2. Audit Logger ─────────────────────────────────────────────────────────
   const auditLogger = createAuditLogger(db, dbPath, {
@@ -580,6 +766,7 @@ export function createApp(envConfig?: EnvConfig): AppInstance {
     securityManager,
     jobQueue,
     alertSystem,
+    ...(settingsService ? { settingsService } : {}),
   });
 
   // ─── Register Socket.IO Event Handlers ───────────────────────────────────────
@@ -653,6 +840,26 @@ export function createApp(envConfig?: EnvConfig): AppInstance {
   function shutdown(): void {
     console.log('[VPS Panel] Shutting down gracefully...');
 
+    // Stop monitoring background jobs
+    if (purgeJobInterval) {
+      clearInterval(purgeJobInterval);
+      purgeJobInterval = null;
+      console.log('[VPS Panel] Metrics purge job stopped');
+    }
+
+    // Stop downsampling engine
+    if (downsamplingEngine) {
+      downsamplingEngine.stop();
+      console.log('[VPS Panel] Downsampling engine stopped');
+    }
+
+    // Dispose settings hot-reload subscription
+    if (hotReloadSubscription) {
+      hotReloadSubscription.dispose();
+      hotReloadSubscription = null;
+      console.log('[VPS Panel] Settings hot-reload disposed');
+    }
+
     // Stop background services
     jobQueue.stop();
     resourceWidget.stopMonitoring();
@@ -670,6 +877,13 @@ export function createApp(envConfig?: EnvConfig): AppInstance {
     // Close Socket.IO connections
     io.close();
 
+    // Close PostgreSQL connection pool
+    if (pgClient) {
+      pgClient.close().catch((err) => {
+        console.error('[VPS Panel] Error closing PostgreSQL:', err);
+      });
+    }
+
     // Close database connection
     closeDatabase(db);
 
@@ -682,8 +896,10 @@ export function createApp(envConfig?: EnvConfig): AppInstance {
     httpServer,
     config,
     db,
+    pgClient,
     modules,
     degradation,
+    initializePostgres,
     startBackgroundServices,
     shutdown,
   };

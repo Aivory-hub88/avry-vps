@@ -1,14 +1,25 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { io, Socket } from 'socket.io-client';
 import { useContainersStore } from '@/stores/containers';
 import { useAuthStore } from '@/stores/auth';
 import StatusBadge from '@/components/StatusBadge.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
+import ContainerResourceBar from '@/components/ContainerResourceBar.vue';
 
 const containersStore = useContainersStore();
 const authStore = useAuthStore();
 
 let refreshInterval: ReturnType<typeof setInterval> | null = null;
+let socket: Socket | null = null;
+
+// Per-container resource usage (updated via Socket.IO resource:update events)
+interface ContainerResourceData {
+  cpuPercent: number;
+  memoryPercent: number;
+}
+
+const containerResources = ref<Record<string, ContainerResourceData>>({});
 
 // Detail panel
 interface ContainerDetail {
@@ -152,11 +163,31 @@ function handleCancel(): void {
 onMounted(() => {
   containersStore.fetchContainers();
   refreshInterval = setInterval(() => containersStore.fetchContainers(), 15000);
+
+  // Connect Socket.IO for real-time resource updates
+  socket = io({ transports: ['websocket'] });
+  socket.on('resource:update', (data: { containers?: Array<{ id: string; name: string; cpuPercent: number; memoryUsageMB: number; memoryLimitMB: number }> }) => {
+    if (data.containers) {
+      for (const c of data.containers) {
+        const memoryPercent = c.memoryLimitMB > 0
+          ? (c.memoryUsageMB / c.memoryLimitMB) * 100
+          : 0;
+        containerResources.value[c.id] = {
+          cpuPercent: c.cpuPercent,
+          memoryPercent,
+        };
+      }
+    }
+  });
 });
 
 onUnmounted(() => {
   if (refreshInterval) {
     clearInterval(refreshInterval);
+  }
+  if (socket) {
+    socket.disconnect();
+    socket = null;
   }
 });
 </script>
@@ -197,6 +228,18 @@ onUnmounted(() => {
           <div class="row-meta">
             <span>Port: {{ container.port || '—' }}</span>
             <span>Uptime: {{ formatUptime(container.uptime) }}</span>
+          </div>
+          <div class="row-resources">
+            <ContainerResourceBar
+              label="CPU"
+              :percentage="containerResources[container.id]?.cpuPercent ?? 0"
+              :stopped="container.status !== 'running'"
+            />
+            <ContainerResourceBar
+              label="Memory"
+              :percentage="containerResources[container.id]?.memoryPercent ?? 0"
+              :stopped="container.status !== 'running'"
+            />
           </div>
         </div>
       </div>
@@ -375,6 +418,13 @@ onUnmounted(() => {
   gap: 1rem;
   font-size: 0.75rem;
   color: var(--color-text-muted);
+}
+
+.row-resources {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
 }
 
 /* Detail panel */
